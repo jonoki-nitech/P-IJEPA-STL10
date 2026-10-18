@@ -57,6 +57,10 @@
 # MSE is measured in the inverse-normalized pixel domain, identical to
 # test_mae_on_selected_patches.py.
 #
+# Batching: the whole batch is processed in CHUNK-sized chunks (env CHUNK,
+# default 1024) so the 8000-image single batch never has to fit in GPU
+# memory at once; selection and evaluation results are identical.
+#
 # Usage example (smoke test):
 #   python patch_selection_reconstruction_eval.py --N 1 --bs 2
 # Full run (heavy on CPU for b = 1):
@@ -101,6 +105,19 @@ SIGMA_VARIANTS = ["sigma_greedy", "sigma_center"]
 OUT_DIR = "images/rec_images_tmax32"
 
 ALL_PATCHES = list(range(144))
+
+# Process large batches in chunks of this many images (env CHUNK to override).
+# Results are identical to one big batch; the peak GPU memory stays at the
+# chunk size (roughly: I-JEPA per-image attention transient ~5.3 MB ->
+# ~5.4 GB at chunk 1024; the 8000-image single batch would need ~43 GB).
+CHUNK_SIZE = int(os.environ.get("CHUNK", "1024"))
+
+
+def iter_chunks(n, chunk_size=None):
+    """Yield (start, end) slices of the batch dimension."""
+    c = CHUNK_SIZE if chunk_size is None else chunk_size
+    for start in range(0, n, c):
+        yield start, min(start + c, n)
 
 
 def block_to_index(left, top, w, h):
@@ -199,7 +216,18 @@ def select_sigma(variant, ijepa, imgs, b, rng, device):
     while active and step < max_steps:
         batch = torch.stack([img_t[i] for i in active]).to(device)
         ctx = [contexts[i] for i in active]
-        sigmas, resid, pred_error = ijepa_forward_batch(ijepa, batch, ctx)
+        # chunked I-JEPA forward (the custom attention materializes the
+        # B x heads x tokens x tokens matrix -> must stay chunk-bounded)
+        sig_c, resid_c, err_c = [], [], []
+        for c0, c1 in iter_chunks(len(active)):
+            s, r, e = ijepa_forward_batch(
+                ijepa, batch[c0:c1], ctx[c0:c1])
+            sig_c.append(s)
+            resid_c.append(r)
+            err_c.append(e)
+        sigmas = torch.cat(sig_c, dim=0)
+        resid = torch.cat(resid_c, dim=0)
+        pred_error = torch.cat(err_c, dim=0)
 
         # mask observed patches, greedy-select the max-sigma b x b window
         sig_masked = sigmas.clone()
@@ -373,29 +401,42 @@ def evaluate_mae(model, xs_norm, contexts_blocks, b, device, inv, t_max,
         input_m = torch.tensor(input_masks, device=device)
         target_m = torch.tensor(target_masks, device=device)
 
-        with torch.no_grad():
-            pred, _, _, _ = model.mae(x, input_m, target_m)
-        x_input, obs_mask_img = obs_visualization(x, target_m)
-        pred_image = model.mae.tokens_as_image(pred.detach())
-        pred_image[obs_mask_img] = x[obs_mask_img]
+        # process the batch in chunks (identical results, bounded memory)
+        mse_row = np.empty(N, dtype=np.float64)
+        gallery_obs, gallery_rec = [], []
+        want = min(gallery_n, N) if (t == t_max and gallery_n > 0) else 0
+        for c0, c1 in iter_chunks(N):
+            x_c = x[c0:c1]
+            with torch.no_grad():
+                pred, _, _, _ = model.mae(
+                    x_c, input_m[c0:c1], target_m[c0:c1])
+            x_input, obs_mask_img = obs_visualization(x_c, target_m[c0:c1])
+            pred_image = model.mae.tokens_as_image(pred.detach())
+            pred_image[obs_mask_img] = x_c[obs_mask_img]
 
-        x_input_inv = inv(x_input)
-        # unobserved patches should be pure black after the inverse transform
-        # (zeros in the normalized domain would render as the dataset mean)
-        x_input_inv = x_input_inv * obs_mask_img.to(x_input_inv.dtype)
-        pred_image_inv = inv(pred_image)
+            x_input_inv = inv(x_input)
+            # unobserved patches should be pure black after the inverse
+            # transform (zeros in the normalized domain would render as
+            # the dataset mean)
+            x_input_inv = x_input_inv * obs_mask_img.to(x_input_inv.dtype)
+            pred_image_inv = inv(pred_image)
 
-        # per-sample pixel MSE over the unobserved region (inv domain)
-        unobs = ~obs_mask_img
-        se = ((pred_image_inv - inv_x) ** 2) * unobs
-        mse[t_idx] = (se.flatten(1).sum(dim=1).cpu().numpy()
-                      / unobs.flatten(1).sum(dim=1).cpu().numpy())
+            # per-sample pixel MSE over the unobserved region (inv domain)
+            unobs = ~obs_mask_img
+            se = ((pred_image_inv - inv_x[c0:c1]) ** 2) * unobs
+            mse_row[c0:c1] = (se.flatten(1).sum(dim=1).cpu().numpy()
+                              / unobs.flatten(1).sum(dim=1).cpu().numpy())
 
-        if t == t_max and gallery_n > 0:
-            n_g = min(gallery_n, N)
+            if want and len(gallery_obs) < want:
+                take = min(want - len(gallery_obs), x_c.shape[0])
+                gallery_obs.append(x_input_inv[:take].detach().cpu())
+                gallery_rec.append(pred_image_inv[:take].detach().cpu())
+
+        mse[t_idx] = mse_row
+        if want:
             final_gallery = {
-                "observed": x_input_inv[:n_g].cpu(),
-                "rec": pred_image_inv[:n_g].cpu(),
+                "observed": torch.cat(gallery_obs)[:want],
+                "rec": torch.cat(gallery_rec)[:want],
             }
 
     return t_list, mse, final_gallery

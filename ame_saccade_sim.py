@@ -20,6 +20,9 @@
 #   python ame_saccade_sim.py            # default N=10, b=2, T_max=10
 #
 # Outputs: images/ame_saccade/b{b}/image_{n}.png   (one grid PNG per image)
+#
+# (AME forward passes are chunked by the shared CHUNK_SIZE of
+#  patch_selection_reconstruction_eval.py, env CHUNK, default 1024.)
 
 import argparse
 import os

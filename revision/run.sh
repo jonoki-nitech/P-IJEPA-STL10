@@ -53,6 +53,7 @@
 #     DEVICE=cpu ...                             # pin the device
 #     GALLERY_N=0 ...                            # skip gallery PNGs
 #     ATTENTION_LAYER=2 ...                      # AME decoder attention block
+#     CHUNK=512 ...                              # chunk size (default 1024)
 #     SKIP_ZIP=1 ...                             # skip packaging
 #     ZIP=result.zip ...                         # zip name
 #
@@ -75,6 +76,7 @@ SEED=${SEED:-0}          # seed for the stochastic strategies
 DEVICE=${DEVICE:-cuda:0} # override with e.g. DEVICE=cpu
 GALLERY_N=${GALLERY_N:-10}
 AME_LAYER=${AME_LAYER:--1} # AME attention layer (-1 = last decoder block)
+export CHUNK=${CHUNK:-1024} # chunk size of the batched forward passes
 
 echo "python : $($PY --version 2>&1)"
 echo "params : N=$N   bs=$BS   seed=$SEED   device=$DEVICE   gallery_n=$GALLERY_N   ame_attention_layer=$AME_LAYER"

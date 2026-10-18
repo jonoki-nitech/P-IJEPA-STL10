@@ -61,8 +61,10 @@ from tqdm import tqdm
 from data_utils import load_stl10
 from mae import MAE
 from patch_selection_reconstruction_eval import (
+    CHUNK_SIZE,
     block_to_index,
     evaluate_mae,
+    iter_chunks,
     plot_results,
     print_summary,
     save_gallery_images,
@@ -193,12 +195,19 @@ def select_ame(model_mae, xs_norm, b, device, attention_layer,
     while active and step < max_steps:
         batch = torch.stack([x[i] for i in active]).to(device)
         ctx = [contexts[i] for i in active]
-        attn = forward_attention(model_mae, batch, ctx, attention_layer)
         observed = torch.zeros(len(active), N_PATCHES, dtype=torch.bool,
-                               device=attn.device)
-        observed[torch.arange(len(active), device=attn.device)[:, None],
-                 torch.tensor(ctx, device=attn.device)] = True
-        pooled = pooled_entropy(attn, observed, b)
+                               device=batch.device)
+        observed[torch.arange(len(active), device=batch.device)[:, None],
+                 torch.tensor(ctx, device=batch.device)] = True
+        # chunked forward + entropy pooling: the patched attention modules
+        # materialize the B x heads x 144 x 144 attention, so keep one chunk
+        # of images at a time instead of the whole active batch
+        pooled_parts = []
+        for c0, c1 in iter_chunks(len(active)):
+            attn_c = forward_attention(
+                model_mae, batch[c0:c1], ctx[c0:c1], attention_layer)
+            pooled_parts.append(pooled_entropy(attn_c, observed[c0:c1], b))
+        pooled = torch.cat(pooled_parts, dim=0)
         A, _, Hp, Wp = pooled.shape
         pooled_flat = pooled.reshape(A, -1)
         best = pooled_flat.argmax(dim=1)
