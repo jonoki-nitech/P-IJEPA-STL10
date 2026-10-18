@@ -4,12 +4,13 @@
 #
 #   Two experiments, end to end, for the hand-off run:
 #     Step 0: uncertainty (sigma) calibration           -> images/calibration/
-#     Step 1: 7 selection strategies x block sizes b=1..4
+#     Step 1: 8 selection strategies (7 baselines + the AME baseline)
+#             x block sizes b=1..4
 #             (patch selection until saturation, evaluation aligned at the
 #              smallest budget) -> per-variant index JSONs + MAE
 #              reconstruction-error vs t
 #
-#   7 strategies generated per block size (all inside ONE script,
+#   8 strategies generated per block size (all inside ONE script,
 #   patch_selection_reconstruction_eval.py handles selection + MAE sweep):
 #     sigma_greedy    : sigma-based selection, random initial block
 #     sigma_center    : sigma-based selection, center initial block
@@ -18,6 +19,9 @@
 #     center_outward  : fixed, center-outward order
 #     raster          : fixed, raster order (top-left initial)
 #     raster_center   : fixed, raster order (center initial block)
+#     ame             : Attention-Map Entropy baseline (Pardyl et al.,
+#                       IJCAI 2023) on the MAE decoder attention;
+#                       deterministic (no seed), duplicate-free truncation
 #
 #   Each variant is truncated at its observable budget (no fully-unobserved
 #   b x b window remains -> the image stops observing, even if steps are
@@ -44,8 +48,10 @@
 #
 #   Overrides:
 #     N=100 PYTHON=... bash revision/run.sh      # first 100 test images only
+#     BS="2 4" ...                               # block sizes (default 1 2 3 4)
 #     DEVICE=cpu ...                             # pin the device
 #     GALLERY_N=0 ...                            # skip gallery PNGs
+#     ATTENTION_LAYER=2 ...                      # AME decoder attention block
 #     SKIP_ZIP=1 ...                             # skip packaging
 #     ZIP=result.zip ...                         # zip name
 #
@@ -63,12 +69,14 @@ set -u
 
 PY=${PYTHON:-python}
 N=${N:-0}               # number of test images (0 = all 8000)
+BS=${BS:-"1 2 3 4"}      # block sizes to evaluate
 SEED=${SEED:-0}          # seed for the stochastic strategies
 DEVICE=${DEVICE:-cuda:0} # override with e.g. DEVICE=cpu
 GALLERY_N=${GALLERY_N:-10}
+AME_LAYER=${AME_LAYER:--1} # AME attention layer (-1 = last decoder block)
 
 echo "python : $($PY --version 2>&1)"
-echo "params : N=$N   seed=$SEED   device=$DEVICE   gallery_n=$GALLERY_N"
+echo "params : N=$N   bs=$BS   seed=$SEED   device=$DEVICE   gallery_n=$GALLERY_N   ame_attention_layer=$AME_LAYER"
 
 # -----------------------------------------------------------------------------
 # Step 0: calibration of the sigma predictor
@@ -89,9 +97,10 @@ $PY calibration_eval.py \
 echo ""
 echo "=== Step 1: selection (7 variants) + MAE reconstruction vs t ======="
 $PY patch_selection_reconstruction_eval.py \
-    --bs 1 2 3 4 \
+    --bs $BS \
     --N "$N" \
     --seed "$SEED" \
+    --attention-layer "$AME_LAYER" \
     --gallery_n "$GALLERY_N" \
     --device "$DEVICE"
 

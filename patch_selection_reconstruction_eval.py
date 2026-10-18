@@ -89,6 +89,7 @@ VARIANTS = [
     "center_outward",
     "raster",
     "raster_center",
+    "ame",
 ]
 SIGMA_VARIANTS = ["sigma_greedy", "sigma_center"]
 OUT_DIR = "images/rec_images_tmax32"
@@ -287,6 +288,27 @@ def select_deterministic(variant, b, N):
     return [list(flat) for _ in range(N)], [steps] * N
 
 
+def select_ame_variant(model_mae, xs_norm, b, device, attention_layer):
+    """ame: Attention-Map Entropy baseline (Pardyl et al., IJCAI 2023),
+    MAE decoder attention; deterministic, duplicate-free truncation like the
+    other strategies (details in patch_selection_ame_eval.py).
+
+    The attention capture needs the timm attention modules of the MAE
+    decoder to be patched; they are restored afterwards so every other
+    variant keeps the untouched forward path.
+
+    Returns (contexts per image [flat patch lists], observed-block steps)."""
+    from patch_selection_ame_eval import select_ame, patch_attention_modules
+    patch_attention_modules(model_mae)
+    try:
+        return select_ame(model_mae, xs_norm, b, device, attention_layer)
+    finally:
+        for block in model_mae.decoder.layers:
+            attn_mod = block.attn
+            if "forward" in attn_mod.__dict__:
+                del attn_mod.__dict__["forward"]
+
+
 # --------------------------------------------------------------------------- #
 #  MAE evaluation over the common t axis
 # --------------------------------------------------------------------------- #
@@ -464,6 +486,10 @@ def main():
                         help='block sizes to evaluate')
     parser.add_argument('--seed', type=int, default=0,
                         help='random seed for the random elements')
+    parser.add_argument('--attention-layer', type=int, default=-1,
+                        help='MAE decoder block whose attention drives the '
+                             'AME selection (0-based; -1 = last decoder '
+                             'block, as in the official AME)')
     parser.add_argument('--tlist', type=int, nargs='+', default=None,
                         help='observation step counts to sweep '
                              '(default: 1..aligned max t)')
@@ -555,6 +581,14 @@ def main():
         torch.load(args.mae_model_path, map_location=device)["state_dict"])
     model.eval()
 
+    if args.attention_layer == -1:
+        attention_layer = model.mae.dec_depth - 1
+    else:
+        attention_layer = args.attention_layer
+        assert 0 <= attention_layer < model.mae.dec_depth
+    print(f'MAE: dec_depth={model.mae.dec_depth}, '
+          f'attention_layer={attention_layer} (AME selection)')
+
     os.makedirs("selected_patch_index", exist_ok=True)
 
     for b in args.bs:
@@ -572,13 +606,16 @@ def main():
             elif variant in ("random_greedy", "random_center"):
                 seqs[variant], stops[variant] = select_random(
                     variant, b, rng, n)
+            elif variant == "ame":
+                seqs[variant], stops[variant] = select_ame_variant(
+                    model.mae, xs_norm, b, device, attention_layer)
             else:
                 seqs[variant], stops[variant] = select_deterministic(
                     variant, b, n)
             print(f'  {variant}: steps min={min(stops[variant])}, '
                   f'max={max(stops[variant])}')
 
-        # JSONs (7 per b, new names with tmax_32)
+        # JSONs (8 per b: 7 sigma/random/fixed variants + AME, tmax_32 names)
         for variant in VARIANTS:
             jpath = os.path.join(
                 "selected_patch_index", f"block_{b}_tmax_32_{variant}.json")
