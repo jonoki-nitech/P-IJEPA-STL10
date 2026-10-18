@@ -7,7 +7,7 @@ import random
 import numpy as np
 from tqdm.auto import tqdm
 from torchinfo import summary
-from torchvision.datasets import STL10
+from data_utils import load_stl10
 
 from simple_ijepa.ijepa import IJEPA
 from simple_ijepa.transformer import VisionTransformer
@@ -22,7 +22,8 @@ SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-torch.cuda.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
 
 
 # cosine EMA schedule (increase from tau_base to one) as defined in https://arxiv.org/abs/2010.07922
@@ -36,7 +37,7 @@ def update_gamma(k, K, tau_base):
 
 
 def train_ijepa(args):
-    device = "cuda:1" # torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dim = 512
     image_size = 96
@@ -61,7 +62,7 @@ def train_ijepa(args):
                   num_targets=num_targets)
 
     if args.ckpt_path:
-        model_state = torch.load(args.ckpt_path)
+        model_state = torch.load(args.ckpt_path, map_location=device)
         ijepa.load_state_dict(model_state)
     ijepa = ijepa.to(device)
 
@@ -74,12 +75,8 @@ def train_ijepa(args):
                                  lr=args.learning_rate,
                                  weight_decay=args.weight_decay)
 
-    stl10_ds = STL10(
-        "/home/jonoki/research/master/byol_trial/ExtreMA_stl10/data",
-        split="unlabeled",
-        download=False,
-        transform=training_transforms((image_size, image_size)),
-    )
+    stl10_ds = load_stl10(split="unlabeled",
+                          transform=training_transforms((image_size, image_size)))
     num_patches = int((image_size // patch_size))**2
     dataset = MaskedImageDataset(stl10_ds,
                                  num_patches=num_patches,
@@ -94,7 +91,7 @@ def train_ijepa(args):
         shuffle=True,
     )
 
-    scaler = GradScaler(enabled=args.fp16_precision)
+    scaler = GradScaler(enabled=args.fp16_precision and torch.cuda.is_available())
 
     stl10_eval = STL10Eval()
     total_num_steps = (len(train_loader) *
@@ -109,7 +106,7 @@ def train_ijepa(args):
         for step, (images, context_indices,
                    target_indices_list) in enumerate(progress_bar):
             images = images.to(device)
-            with autocast(enabled=args.fp16_precision):
+            with autocast(enabled=args.fp16_precision and torch.cuda.is_available()):
                 loss = ijepa(images, context_indices, target_indices_list)
 
             optimizer.zero_grad()

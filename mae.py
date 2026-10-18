@@ -314,10 +314,11 @@ class MAE(pl.LightningModule):
     def on_train_batch_end(self, *args, **kwargs):
         if self.trainer.global_step == 2 and self.trainer.is_global_zero:
             # print GPU memory usage once at beginning of training
-            avail, total = torch.cuda.mem_get_info()
-            mem_used = 100 * (1 - (avail / total))
-            gb = 1024**3
-            self.print(f'GPU memory used: {(total-avail)/gb:.2f} of {total/gb:.2f} GB ({mem_used:.2f}%)')
+            if torch.cuda.is_available():
+                avail, total = torch.cuda.mem_get_info()
+                mem_used = 100 * (1 - (avail / total))
+                gb = 1024**3
+                self.print(f'GPU memory used: {(total-avail)/gb:.2f} of {total/gb:.2f} GB ({mem_used:.2f}%)')
         if self.trainer.num_nodes > 1 or self.trainer.num_devices > 1:
             distributed.barrier()
 

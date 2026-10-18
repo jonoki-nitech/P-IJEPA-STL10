@@ -10,6 +10,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 
 from simple_ijepa.utils import inference_transforms
+from data_utils import get_stl10_root, ensure_stl10_splits, STL10Partial
 
 import warnings
 
@@ -35,17 +36,17 @@ class STL10Eval:
 
     def __init__(self, image_size=96):
         self.device = torch.device(
-            "cuda:1" if torch.cuda.is_available() else "cpu")
+            "cuda" if torch.cuda.is_available() else "cpu")
 
         transform = inference_transforms(img_size=(image_size, image_size))
-        train_ds = torchvision.datasets.STL10("/home/jonoki/research/master/byol_trial/ExtreMA_stl10/data",
-                                              split='train',
-                                              transform=transform,
-                                              download=False)
-        val_ds = torchvision.datasets.STL10("/home/jonoki/research/master/byol_trial/ExtreMA_stl10/data",
-                                            split='test',
-                                            transform=transform,
-                                            download=False)
+        ensure_stl10_splits(("train", "test"))
+        root = get_stl10_root()
+        train_ds = STL10Partial(root,
+                                split='train',
+                                transform=transform)
+        val_ds = STL10Partial(root,
+                              split='test',
+                              transform=transform)
 
         self.train_loader = DataLoader(train_ds, batch_size=64, num_workers=2)
         self.val_loader = DataLoader(val_ds, batch_size=64, num_workers=2)

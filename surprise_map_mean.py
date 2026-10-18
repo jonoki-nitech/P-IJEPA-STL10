@@ -1,7 +1,7 @@
 from simple_ijepa.transformer import  VisionTransformer
 from simple_ijepa.ijepa import IJEPA
 import torch
-from torchvision.datasets import STL10
+from data_utils import load_stl10
 from torchvision import transforms
 from einops.layers.torch import Rearrange
 from torchvision.utils import save_image
@@ -136,15 +136,11 @@ def select_next_block(sigma, patch_size=8, k=4, stride=1):
 if __name__ == "__main__":
 
     # params
-    device = "cuda:1"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # dataset
-    stl10_ds = STL10(
-    "/home/jonoki/research/master/byol_trial/ExtreMA_stl10/data",
-    split="test",
-    download=False,
-    transform=transforms.ToTensor(),
-    )
+    stl10_ds = load_stl10(split="test",
+                          transform=transforms.ToTensor())
 
     # model
     encoder = VisionTransformer(

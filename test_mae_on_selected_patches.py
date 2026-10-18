@@ -1,4 +1,4 @@
-from torchvision.datasets import STL10
+from data_utils import get_stl10_root, ensure_stl10_splits, STL10Partial
 from torchvision import transforms
 import json
 from simple_ijepa.transformer import  VisionTransformer
@@ -16,12 +16,19 @@ import torchvision.utils as vutils
 from PIL import Image, ImageDraw, ImageFont
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
+import sys
 import os
 
-class STL10WithMasks(STL10):
-    def __init__(self, root, split='train', input_patch_num=10, mask_list=None, transform=None, target_transform=None, download=False):
+class STL10WithMasks(STL10Partial):
+    def __init__(self, root, split='train', input_patch_num=10, mask_list=None, transform=None, target_transform=None, download=False, num_images=None):
         super().__init__(root=root, split=split, transform=transform,
-                         target_transform=target_transform, download=download)
+                         target_transform=target_transform)
+
+        # 先頭num_images枚のみを対象にする (None = 全枚)
+        if num_images is not None:
+            self.data = self.data[:num_images]
+            self.labels = self.labels[:num_images]
+            mask_list = mask_list[:num_images]
 
         if mask_list is None:
             raise ValueError("mask_list must be provided.")
@@ -133,7 +140,7 @@ def visualize_rec_image(img, rec_patches, target_mask):
 if __name__ == "__main__":
 
     # params
-    device = "cuda:0"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     mode = "test"
 
@@ -146,25 +153,32 @@ if __name__ == "__main__":
     with open(f"selected_patch_index/block_{block_size}_tmax_20_test_random_.json", "r") as f:
         mask_list_test_random = json.load(f)
 
+    ensure_stl10_splits(("test",))
+
+    # 先頭N枚のテスト画像のみ処理 (引数未指定 = 全枚)
+    n_limit = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+
     # dataset
     stl10_ds_test = STL10WithMasks(
-    "/home/jonoki/research/master/byol_trial/ExtreMA_stl10/data",
+    get_stl10_root(),
     split="test",
     download=False,
     transform=transforms.Compose([transforms.ToTensor(),
                                  transforms.Normalize((0.4467, 0.4398, 0.4066), (0.2603, 0.2566, 0.2713))]),
     mask_list=mask_list_test,
-    input_patch_num=input_patch_num
+    input_patch_num=input_patch_num,
+    num_images=(n_limit if n_limit > 0 else None)
     )
 
     stl10_ds_test_random = STL10WithMasks(
-    "/home/jonoki/research/master/byol_trial/ExtreMA_stl10/data",
+    get_stl10_root(),
     split="test",
     download=False,
     transform=transforms.Compose([transforms.ToTensor(),
                                  transforms.Normalize((0.4467, 0.4398, 0.4066), (0.2603, 0.2566, 0.2713))]),
     mask_list=mask_list_test_random,
-    input_patch_num=input_patch_num
+    input_patch_num=input_patch_num,
+    num_images=(n_limit if n_limit > 0 else None)
     )
 
     # train_data_loader = torch.utils.data.DataLoader(
@@ -181,7 +195,7 @@ if __name__ == "__main__":
 
     # test (visualize reconstructed image)
     N = len(stl10_ds_test)
-    state_dict = torch.load("models/mae/latest.ckpt")
+    state_dict = torch.load("models/mae/latest.ckpt", map_location=device)
     model.load_state_dict(state_dict["state_dict"])
     normalize = transforms.Normalize(
         mean=(0.4467, 0.4398, 0.4066),

@@ -1,0 +1,29 @@
+# --- models (large) ---
+models/
+*.pth
+*.pth.tar
+*.ckpt
+
+# --- data ---
+data/
+
+# --- experiment outputs / artefacts ---
+images/
+selected_patch_index/
+result.zip
+results/
+
+# --- caches / logs / temporary files ---
+__pycache__/
+*.pyc
+*.pyo
+*.log
+tmp.png
+README_old.md
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+*~
+.vscode/
+.idea/

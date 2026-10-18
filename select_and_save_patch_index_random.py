@@ -1,7 +1,7 @@
 from simple_ijepa.transformer import  VisionTransformer
 from simple_ijepa.ijepa import IJEPA
 import torch
-from torchvision.datasets import STL10
+from data_utils import load_stl10
 from torchvision import transforms
 from einops.layers.torch import Rearrange
 from torchvision.utils import save_image
@@ -11,6 +11,7 @@ import numpy as np
 import torch.nn.functional as F
 import random
 import json
+import sys
 from tqdm import tqdm
 import os
 
@@ -33,24 +34,20 @@ def block_to_index(left, top, w, h):
 if __name__ == "__main__":
 
     # params
-    device = "cuda:1"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # dataset
-    stl10_ds_train = STL10(
-    "/home/jonoki/research/master/byol_trial/ExtreMA_stl10/data",
-    split="unlabeled",
-    download=False,
-    transform=transforms.ToTensor(),
-    )
-    stl10_ds_test = STL10(
-    "/home/jonoki/research/master/byol_trial/ExtreMA_stl10/data",
-    split="test",
-    download=False,
-    transform=transforms.ToTensor(),
-    )
+    # NOTE: unlabeled はこのスクリプトでは使用しないため読み込まない
+    stl10_ds_test = load_stl10(split="test",
+                               transform=transforms.ToTensor())
 
 
     N = len(stl10_ds_test)
+
+    # 先頭N枚のテスト画像のみ処理 (引数未指定 = 全枚)
+    n_limit = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    if n_limit > 0:
+        N = min(n_limit, N)
     T = 20
     block_size = 2
 

@@ -1,12 +1,13 @@
 import argparse
 
 from train import train_ijepa
+from data_utils import get_stl10_root
 import os
 
 parser = argparse.ArgumentParser(description='I-JEPA')
 parser.add_argument('--dataset_path',
-                    default='/home/jonoki/research/master/byol_trial/ExtreMA_stl10/data',
-                    help='Path where datasets will be saved')
+                    default=None,
+                    help='Path where datasets will be saved (未指定時は自動判定)')
 parser.add_argument('--dataset_name',
                     default='stl10',
                     help='Dataset name',
@@ -57,6 +58,8 @@ parser.add_argument('--ckpt_path',
 
 def main():
     args = parser.parse_args()
+    if args.dataset_path is None:
+        args.dataset_path = get_stl10_root()
     os.makedirs(args.save_model_dir, exist_ok=True)
     train_ijepa(args)
 

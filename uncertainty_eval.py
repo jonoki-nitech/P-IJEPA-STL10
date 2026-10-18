@@ -1,13 +1,15 @@
 from simple_ijepa.transformer import  VisionTransformer
 from simple_ijepa.ijepa import IJEPA
 import torch
-from torchvision.datasets import STL10
+from data_utils import load_stl10
 from torchvision import transforms
 from einops.layers.torch import Rearrange
 from torchvision.utils import save_image
 import matplotlib.cm as cm
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+import sys
 import os
 
 def reconstruct_img_from_patch(ori_img, patch_index, patch_size=8):
@@ -60,7 +62,9 @@ def to_color_tensor(x, cmap='viridis'):
     # x_min, x_max = x.min(), x.max()
     x_min, x_max=0.25, 0.55
     x_norm = (x - x_min) / (x_max - x_min)
-    colormap = cm.get_cmap(cmap)
+    colormap = (matplotlib.colormaps[cmap]
+                if hasattr(matplotlib, "colormaps")
+                else cm.get_cmap(cmap))
     x_color = torch.from_numpy(colormap(x_norm.numpy())[:, :, :3])  # (H, W, 3)
     x_color = x_color.permute(2, 0, 1)  # (3, H, W)
     return x_color
@@ -82,15 +86,11 @@ def block_to_index(left, top, w, h):
 if __name__ == "__main__":
 
     # params
-    device = "cuda:1"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # dataset
-    stl10_ds = STL10(
-    "/home/jonoki/research/master/byol_trial/ExtreMA_stl10/data",
-    split="test",
-    download=False,
-    transform=transforms.ToTensor(),
-    )
+    stl10_ds = load_stl10(split="test",
+                          transform=transforms.ToTensor())
 
     # model
     encoder = VisionTransformer(
@@ -115,7 +115,7 @@ if __name__ == "__main__":
     # inference
     ijepa.eval()
 
-    N = 100
+    N = int(sys.argv[1]) if len(sys.argv) > 1 else 100
 
     sigmas_list = torch.zeros([N, 144])
     pred_error_list = torch.zeros_like(sigmas_list)
@@ -130,6 +130,7 @@ if __name__ == "__main__":
         all_index = range(144)
 
         context_indices_list = [block_to_index(4, 4, 4, 4)]# +block_to_index(8, 4, 2, 2)]
+        observed_patch_index = context_indices_list[0]
         # t = [x for x in all_index if x not in context_indices_list[0]]
         target_indices_list = [[all_index]]
 
@@ -195,11 +196,13 @@ if __name__ == "__main__":
             # plot sigmas and pred error
 
 
-    sigmas_list = sigmas_list.flatten().cpu().numpy()
-    pred_error_list = pred_error_list.flatten().cpu().numpy()
+    # 散布図は未観測パッチのみを対象にする (観測済みパッチは除外)
+    unobserved_mask = [x for x in range(144) if x not in observed_patch_index]
+    sigmas_unobs = sigmas_list[:, unobserved_mask].flatten().cpu().numpy()
+    pred_error_unobs = pred_error_list[:, unobserved_mask].flatten().cpu().numpy()
 
-    corr = np.corrcoef(sigmas_list, pred_error_list)[0, 1]
-    plt.scatter(sigmas_list, pred_error_list, alpha=0.1)
+    corr = np.corrcoef(sigmas_unobs, pred_error_unobs)[0, 1]
+    plt.scatter(sigmas_unobs, pred_error_unobs, alpha=0.1)
     plt.xlabel("uncertainty")
     plt.ylabel("prediction error")
     plt.title(f"corr = {corr}")

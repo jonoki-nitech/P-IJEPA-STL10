@@ -1,7 +1,7 @@
 from simple_ijepa.transformer import  VisionTransformer
 from simple_ijepa.ijepa import IJEPA
 import torch
-from torchvision.datasets import STL10
+from data_utils import load_stl10
 from torchvision import transforms
 from einops.layers.torch import Rearrange
 from torchvision.utils import save_image
@@ -11,6 +11,7 @@ import numpy as np
 import torch.nn.functional as F
 import random
 import json
+import sys
 from tqdm import tqdm
 import os
 
@@ -104,29 +105,18 @@ def select_next_block(sigma, patch_size=8, k=4, stride=1):
 if __name__ == "__main__":
 
     # params
-    device = "cuda:0"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # dataset
-    stl10_ds_unlabel = STL10(
-    "/home/jonoki/research/master/byol_trial/ExtreMA_stl10/data",
-    split="unlabeled",
-    download=False,
-    transform=transforms.ToTensor(),
-    )
+    # NOTE: unlabeled/train はこのスクリプトでは使用しないため読み込まない
+    stl10_ds_test = load_stl10(split="test",
+                               transform=transforms.ToTensor())
 
-    stl10_ds_train = STL10(
-    "/home/jonoki/research/master/byol_trial/ExtreMA_stl10/data",
-    split="train",
-    download=False,
-    transform=transforms.ToTensor(),
-    )
-
-    stl10_ds_test = STL10(
-    "/home/jonoki/research/master/byol_trial/ExtreMA_stl10/data",
-    split="test",
-    download=False,
-    transform=transforms.ToTensor(),
-    )
+    # 先頭N枚のテスト画像のみ処理 (引数未指定 = 全枚)
+    n_limit = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    if n_limit > 0:
+        stl10_ds_test = torch.utils.data.Subset(
+            stl10_ds_test, range(min(n_limit, len(stl10_ds_test))))
 
     dataloader = torch.utils.data.DataLoader(
         stl10_ds_test,
@@ -134,7 +124,8 @@ if __name__ == "__main__":
         drop_last=False,
         shuffle=False,
         pin_memory=True,
-        num_workers=16,
+        # CPU (特にWindows) ではworker起動のspawnが重いため0にする
+        num_workers=(16 if device.type == "cuda" else 0),
         persistent_workers=False)
 
     # model
@@ -160,7 +151,6 @@ if __name__ == "__main__":
     # inference
     ijepa.eval()
 
-    N = len(stl10_ds_unlabel)
     T = 20
     block_size = 2
 
