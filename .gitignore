@@ -1,5 +1,4 @@
-# --- models (large) ---
-models/
+# --- models (large binaries only; the folder skeleton is kept in git) ---
 *.pth
 *.pth.tar
 *.ckpt
