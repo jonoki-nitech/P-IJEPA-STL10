@@ -16,6 +16,8 @@ conda activate p-ijepa_stl10
 DEVICE=cuda:0 bash revision/run.sh 2>&1 | tee run.log
 ```
 
+- バッチ処理は `CHUNK` 枚ずつの分割実行になります(既定 1024)。GPUメモリが足りない場合は小さくしてください(例: `CHUNK=512 DEVICE=cuda:0 bash revision/run.sh` で ~5GB 程度に)。結果(選択・再構成誤差)は分割しない場合と同一です。
+
 ## 成果物の保存先
 
 | 成果物                                        | 保存先                                             |
