@@ -21,7 +21,8 @@
 #     raster_center   : fixed, raster order (center initial block)
 #     ame             : Attention-Map Entropy baseline (Pardyl et al.,
 #                       IJCAI 2023) on the MAE decoder attention;
-#                       deterministic (no seed), duplicate-free truncation
+#                       random initial block (seeded), duplicate-free
+#                       truncation
 #
 #   Each variant is truncated at its observable budget (no fully-unobserved
 #   b x b window remains -> the image stops observing, even if steps are

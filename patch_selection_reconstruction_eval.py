@@ -1,5 +1,6 @@
-﻿# Patch selection -> reconstruction evaluation with 7 selection variants.
-# Style/output follow the reference test_mae_vs_t.py.
+﻿# Patch selection -> reconstruction evaluation with 8 selection variants
+# (7 baselines + the AME baseline). Style/output follow the reference
+# test_mae_vs_t.py.
 #
 # Selection variants:
 #   sigma_greedy      existing sigma-greedy: random initial b x b block, then
@@ -16,6 +17,11 @@
 #   raster            deterministic reading order from the top-left
 #   raster_center     center start (same center coordinates as the other center
 #                     variants), then reading order
+#   ame               Attention-Map Entropy baseline (Pardyl et al., IJCAI
+#                     2023, apardyl/AME): random initial b x b block (shared
+#                     seed), then repeatedly add the (sliding) b x b window
+#                     with the largest attention-map entropy of the MAE
+#                     decoder (see patch_selection_ame_eval.py)
 #
 # Truncation: when no fully-unobserved b x b window remains, that image stops
 # observing (breaking even if steps are left). Without this, the sigma variants
@@ -42,7 +48,7 @@
 #                              reconstruction at the final t), first
 #                              --gallery_n samples
 #   selected_patch_index/block_{b}_tmax_32_{variant}.json
-#                              duplicate-free observed index lists (7 per b;
+#                              duplicate-free observed index lists (8 per b;
 #                              new names avoid the old tmax=20)
 #
 # Calibration artifacts are produced separately by calibration_eval.py.
@@ -288,10 +294,18 @@ def select_deterministic(variant, b, N):
     return [list(flat) for _ in range(N)], [steps] * N
 
 
-def select_ame_variant(model_mae, xs_norm, b, device, attention_layer):
+def select_ame_variant(model_mae, xs_norm, b, device, attention_layer,
+                       rng=None, random_first=True):
     """ame: Attention-Map Entropy baseline (Pardyl et al., IJCAI 2023),
-    MAE decoder attention; deterministic, duplicate-free truncation like the
-    other strategies (details in patch_selection_ame_eval.py).
+    MAE decoder attention; duplicate-free truncation like the other
+    strategies (details in patch_selection_ame_eval.py).
+
+    The INITIAL b x b block is drawn uniformly at random from the valid
+    sliding anchors with the shared rng (same seed as the other
+    random-initial variants, sigma_greedy / random_greedy); the subsequent
+    blocks come from the attention-map entropy. Set random_first=False for
+    the official default instead (zero-step attention argmax, deterministic
+    and identical for every image).
 
     The attention capture needs the timm attention modules of the MAE
     decoder to be patched; they are restored afterwards so every other
@@ -301,7 +315,8 @@ def select_ame_variant(model_mae, xs_norm, b, device, attention_layer):
     from patch_selection_ame_eval import select_ame, patch_attention_modules
     patch_attention_modules(model_mae)
     try:
-        return select_ame(model_mae, xs_norm, b, device, attention_layer)
+        return select_ame(model_mae, xs_norm, b, device, attention_layer,
+                          random_first=random_first, rng=rng)
     finally:
         for block in model_mae.decoder.layers:
             attn_mod = block.attn
@@ -608,7 +623,7 @@ def main():
                     variant, b, rng, n)
             elif variant == "ame":
                 seqs[variant], stops[variant] = select_ame_variant(
-                    model.mae, xs_norm, b, device, attention_layer)
+                    model.mae, xs_norm, b, device, attention_layer, rng)
             else:
                 seqs[variant], stops[variant] = select_deterministic(
                     variant, b, n)
