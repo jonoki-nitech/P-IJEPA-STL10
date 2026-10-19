@@ -263,29 +263,44 @@ def select_random(variant, b, rng, N):
     Returns (contexts per image [flat patch lists], observed-block steps)."""
     max_steps = 144 // (b * b)
     anchors = sliding_anchors(b)
+    # precompute every anchor's patch list / patch set once: the naive
+    # block_to_index-per-(image, step, anchor) loop builds a torch tensor
+    # and an einops Rearrange module per call (~0.2 ms), which used to
+    # silently take hours for N=8000 (7 h for b=1 alone)
+    anchor_patches = [block_to_index(left, top, b, b)
+                      for (top, left) in anchors]
+    anchor_sets = [frozenset(p) for p in anchor_patches]
+
+    # NOTE: the rng draw pattern must stay exactly as before (one init draw
+    # per image for the greedy variants, then one draw per step taken from
+    # the valid anchors in anchor order) so seeded runs keep reproducing
+    # the very same selection sequences.
     if variant == "random_center":
-        init = [center_window_patches(b)] * N
+        init = [[center_window_patches(b)] for _ in range(N)]
     else:  # random initial block
         init = []
         for _ in range(N):
-            top, left = anchors[rng.integers(len(anchors))]
-            init.append(block_to_index(left, top, b, b))
+            init.append([list(anchor_patches[rng.integers(len(anchors))])])
 
     contexts, steps = [], []
     for i in range(N):
-        observed = set(init[i])
-        seq = [list(init[i])]
+        observed = set(init[i][0])
+        seq = [list(init[i][0])]
         for _ in range(max_steps - 1):
-            valid = [a for a in anchors
-                     if not (set(block_to_index(a[1], a[0], b, b)) & observed)]
+            valid = [k for k in range(len(anchors))
+                     if observed.isdisjoint(anchor_sets[k])]
             if not valid:
                 break      # truncation: no fully-unobserved window remains
-            top, left = valid[rng.integers(len(valid))]
-            window = block_to_index(left, top, b, b)
-            observed |= set(window)
-            seq.append(window)
+            k = valid[rng.integers(len(valid))]
+            window = anchor_patches[k]
+            observed.update(anchor_sets[k])
+            seq.append(list(window))
         contexts.append([p for blk in seq for p in blk])
         steps.append(len(seq))
+        if (i + 1) % 500 == 0 or i + 1 == N:
+            print(f"\r    {variant}: sequences {i + 1}/{N}",
+                  end="", flush=True)
+    print()
     return contexts, steps
 
 
@@ -669,7 +684,7 @@ def main():
                 seqs[variant], stops[variant] = select_deterministic(
                     variant, b, n)
             print(f'  {variant}: steps min={min(stops[variant])}, '
-                  f'max={max(stops[variant])}')
+                  f'max={max(stops[variant])}', flush=True)
 
         # JSONs (8 per b: 7 sigma/random/fixed variants + AME, tmax_32 names)
         for variant in VARIANTS:
@@ -690,7 +705,8 @@ def main():
         dropped = [f"{v}(budget={variant_max_t[v]})" for v in VARIANTS
                    if variant_max_t[v] > t_eval]
         print(f"aligned max t = {t_eval} "
-              f"(truncated variants beyond their saturation: {dropped})")
+              f"(truncated variants beyond their saturation: {dropped})",
+              flush=True)
         t_list = (args.tlist if args.tlist is not None
                   else list(range(1, t_eval + 1)))
         t_list = [t for t in t_list if t <= t_eval]

@@ -69,6 +69,8 @@
 set -e
 set -u
 
+export PYTHONUNBUFFERED=1 # real-time log lines even when piped through tee
+
 PY=${PYTHON:-python}
 N=${N:-0}               # number of test images (0 = all 8000)
 BS=${BS:-"1 2 3 4"}      # block sizes to evaluate
