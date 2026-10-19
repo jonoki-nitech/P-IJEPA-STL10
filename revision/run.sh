@@ -4,14 +4,12 @@
 #
 #   Two experiments, end to end, for the hand-off run:
 #     Step 0: uncertainty (sigma) calibration           -> images/calibration/
-#     Step 1: 8 selection strategies (7 baselines + the AME baseline)
-#             x block sizes b=1..4
-#             (patch selection until saturation, evaluation aligned at the
-#              smallest budget) -> per-variant index JSONs + MAE
-#              reconstruction-error vs t
+#     Step 1: 10 selection strategies (7 baselines + AME + the 2 lookahead
+#             variants) x block sizes b=1..4 in ONE script
+#             (patch_selection_reconstruction_eval.py handles selection +
+#              MAE sweep; all strategies share one aligned t axis)
 #
-#   8 strategies generated per block size (all inside ONE script,
-#   patch_selection_reconstruction_eval.py handles selection + MAE sweep):
+#   10 strategies generated per block size:
 #     sigma_greedy    : sigma-based selection, random initial block
 #     sigma_center    : sigma-based selection, center initial block
 #     random_greedy   : random selection, random initial block
@@ -23,16 +21,30 @@
 #                       IJCAI 2023) on the MAE decoder attention;
 #                       random initial block (seeded), duplicate-free
 #                       truncation
+#     sigma_lookahead : 1-step lookahead sigma minimisation, random initial
+#                       block (simulate every top-M candidate with its
+#                       mu-predicted features, pick the one that minimises
+#                       the total sigma left unobserved; M=16 default)
+#     sigma_lookahead_center : same with the center initial block
+#
+#   While selecting, the sigma-based and lookahead variants record, per image
+#   and step, the total sigma still unobserved; the lookahead variants also
+#   record the sigma rank of each chosen block. All of it lands in
+#   images/rec_images_tmax32/b{b}/sigma_sum_traj.pt.
 #
 #   Each variant is truncated at its observable budget (no fully-unobserved
 #   b x b window remains -> the image stops observing, even if steps are
 #   left); the MAE evaluation aligns all strategies at
 #   aligned_max_t = min(144/b^2 - 1, min over (variant, image) budgets),
 #   i.e. plotting stops where duplicated observations would begin.
+#   The random-initial variants (sigma_greedy / random_greedy / ame /
+#   sigma_lookahead) share ONE initial block per image (paired comparison;
+#   different images keep independent draws).
 #   Outputs go to images/rec_images_tmax32/b{b}/ (rec_error_vs_t.png/csv/pt,
-#   gallery/nXXXX.png for the first --gallery_n samples) and the selection
-#   JSONs to selected_patch_index/block_{b}_tmax_32_{variant}.json
-#   (the earlier tmax_20 artifacts are left untouched).
+#   sigma_sum_traj.pt, gallery/nXXXX.png for the first --gallery_n samples)
+#   and the selection JSONs to selected_patch_index/_
+#   block_{b}_tmax_32_{variant}.json (the earlier tmax_20 artifacts are left
+#   untouched).
 #
 #   Step 0 (calibration) outputs images/calibration/:
 #   reliability diagram + metrics CSV + calibration_points.pt (per-point
@@ -54,8 +66,16 @@
 #     GALLERY_N=0 ...                            # skip gallery PNGs
 #     ATTENTION_LAYER=2 ...                      # AME decoder attention block
 #     CHUNK=512 ...                              # chunk size (default 1024)
+#     M=8 ...                                    # lookahead candidate prescreen
+#                                                #  (default 16; ALL_CANDIDATES=1
+#                                                #  disables the prescreen,
+#                                                #  VERY slow for b=1)
 #     SKIP_ZIP=1 ...                             # skip packaging
 #     ZIP=result.zip ...                         # zip name
+#
+#   Runtime on one 24 GB GPU at N=8000: calibration a few minutes, the 8 fast
+#   variants ~2.5-4 h, each lookahead variant ~4-5 h (b=1 dominates), so the
+#   full run is roughly ~12-14 h including the MAE sweeps.
 #
 #   Requires: torch, torchvision, numpy, matplotlib, einops, tqdm.
 #   Models: I-JEPA at
@@ -78,10 +98,11 @@ SEED=${SEED:-0}          # seed for the stochastic strategies
 DEVICE=${DEVICE:-cuda:0} # override with e.g. DEVICE=cpu
 GALLERY_N=${GALLERY_N:-10}
 AME_LAYER=${AME_LAYER:--1} # AME attention layer (-1 = last decoder block)
+LOOKAHEAD_M=${M:-16}     # lookahead candidate prescreen size
 export CHUNK=${CHUNK:-1024} # chunk size of the batched forward passes
 
 echo "python : $($PY --version 2>&1)"
-echo "params : N=$N   bs=$BS   seed=$SEED   device=$DEVICE   gallery_n=$GALLERY_N   ame_attention_layer=$AME_LAYER"
+echo "params : N=$N   bs=$BS   seed=$SEED   device=$DEVICE   gallery_n=$GALLERY_N   ame_attention_layer=$AME_LAYER   lookahead_M=$LOOKAHEAD_M"
 
 # -----------------------------------------------------------------------------
 # Step 0: calibration of the sigma predictor
@@ -97,15 +118,22 @@ $PY calibration_eval.py \
     --device "$DEVICE"
 
 # -----------------------------------------------------------------------------
-# Step 1: block sizes b = 1..4 (selection + MAE error-vs-t, one script)
+# Step 1: block sizes b = 1..4 (selection of all 10 strategies + MAE
+#         error-vs-t + uncertainty trajectories, one script)
 # -----------------------------------------------------------------------------
 echo ""
-echo "=== Step 1: selection (7 variants) + MAE reconstruction vs t ======="
+echo "=== Step 1: selection (10 variants) + MAE reconstruction vs t ======"
+LOOKAHEAD_FLAGS=""
+if [ "${ALL_CANDIDATES:-0}" = "1" ]; then
+    LOOKAHEAD_FLAGS="--all-candidates"
+fi
 $PY patch_selection_reconstruction_eval.py \
     --bs $BS \
     --N "$N" \
     --seed "$SEED" \
     --attention-layer "$AME_LAYER" \
+    --M "$LOOKAHEAD_M" \
+    $LOOKAHEAD_FLAGS \
     --gallery_n "$GALLERY_N" \
     --device "$DEVICE"
 

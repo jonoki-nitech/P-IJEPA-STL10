@@ -158,8 +158,12 @@ def forward_attention(model_mae, xs, contexts, attention_layer):
 
 
 def select_ame(model_mae, xs_norm, b, device, attention_layer,
-               random_first=False, rng=None):
+               random_first=False, rng=None, init_blocks=None):
     """AME selection for block size b.
+
+    init_blocks: shared per-image initial block (flat patch list per image;
+    when given it replaces the --random-first draw, so the initial glimpses
+    are identical to the other random-initial variants).
 
     Returns (flat observed patch lists per image, observed-block steps)."""
     N = len(xs_norm)
@@ -168,7 +172,11 @@ def select_ame(model_mae, xs_norm, b, device, attention_layer,
 
     contexts = []
     observed_sets = []
-    if random_first and rng is not None:
+    if init_blocks is not None:
+        # shared initial block (paired comparison with the other
+        # random-initial variants); no rng draw here
+        contexts = [list(c) for c in init_blocks]
+    elif random_first and rng is not None:
         # official --random-first option: first glimpse uniformly random
         for _ in range(N):
             top, left = rng.integers(0, GRID - b + 1, size=2)

@@ -1,16 +1,18 @@
-﻿# Patch selection -> reconstruction evaluation with 8 selection variants
-# (7 baselines + the AME baseline). Style/output follow the reference
-# test_mae_vs_t.py.
+﻿# Patch selection -> reconstruction evaluation with 10 selection variants
+# (7 baselines + the AME baseline + the two 1-step-lookahead variants).
+# Style/output follow the reference test_mae_vs_t.py.
 #
 # Selection variants:
-#   sigma_greedy      existing sigma-greedy: random initial b x b block, then
-#                     repeatedly add the (sliding) b x b window with the largest
-#                     sigma among fully-unobserved windows
+#   sigma_greedy      existing sigma-greedy: random initial b x b block (the
+#                     shared per-image draw), then repeatedly add the
+#                     (sliding) b x b window with the largest sigma among
+#                     fully-unobserved windows
 #   sigma_center      same as sigma_greedy but the initial block is the center
 #                     block (same center coordinates as the other center
 #                     variants)
-#   random_greedy     existing random: random initial block, then add a random
-#                     fully-unobserved (sliding) b x b window per step
+#   random_greedy     existing random: random initial block (the shared
+#                     per-image draw), then add a random fully-unobserved
+#                     (sliding) b x b window per step
 #   random_center     same as random_greedy but the initial block is the center
 #   center_outward    deterministic: observe tiles in distance order from the
 #                     image center outward
@@ -18,10 +20,36 @@
 #   raster_center     center start (same center coordinates as the other center
 #                     variants), then reading order
 #   ame               Attention-Map Entropy baseline (Pardyl et al., IJCAI
-#                     2023, apardyl/AME): random initial b x b block (shared
-#                     seed), then repeatedly add the (sliding) b x b window
-#                     with the largest attention-map entropy of the MAE
-#                     decoder (see patch_selection_ame_eval.py)
+#                     2023, apardyl/AME): random initial b x b block (the
+#                     shared per-image draw), then repeatedly add the (sliding)
+#                     b x b window with the largest attention-map entropy of
+#                     the MAE decoder (see patch_selection_ame_eval.py)
+#   sigma_lookahead   1-step lookahead sigma minimisation, random initial
+#                     block: every top-M candidate block (by the current
+#                     pooled sigma) is SIMULATED by feeding its mu-predicted
+#                     features (+pos emb) as if observed, and the candidate
+#                     whose simulated sigma map leaves the smallest total
+#                     sigma over the remaining unobserved patches is chosen
+#                     (--M prescreen, --all-candidates disables it)
+#   sigma_lookahead_center
+#                     same as sigma_lookahead but the initial block is the
+#                     center block
+#
+# Shared random initial block: the initial b x b block is drawn ONCE per
+# image (from the shared seeded rng, one uniform draw over the sliding
+# anchors) and the SAME block is used by every random-initial variant
+# (sigma_greedy / random_greedy / ame / sigma_lookahead). The comparison
+# between strategies is therefore paired on the initialization luck;
+# different images keep independent draws.
+#
+# The lookahead simulation runs an extra sigma-predictor pass per candidate
+# (batched in (images x candidates) chunks of CHUNK_SIZE rows).
+#
+# Uncertainty recording: while selecting, the sigma-based variants record,
+# per image and state (t blocks observed), the sum of sigma over the patches
+# still unobserved (sigma_sum); the lookahead variants additionally record
+# the 1-based sigma rank (descending among valid anchors, pooled sigma) of
+# the block they choose. All of it is saved to b{b}/sigma_sum_traj.pt.
 #
 # Truncation: when no fully-unobserved b x b window remains, that image stops
 # observing (breaking even if steps are left). Without this, the sigma variants
@@ -43,12 +71,15 @@
 #   b{b}/rec_error_vs_t.pt     raw per-sample MSE arrays + alignment metadata
 #                              (variant_max_t, aligned_max_t) for later
 #                              analysis; re-plottable via --points_pt
+#   b{b}/sigma_sum_traj.pt     per-image uncertainty trajectories
+#                              (sigma_sum per variant; sigma_rank for the
+#                              lookahead variants)
 #   b{b}/gallery/nXXXX.png     per-sample gallery (rows: original / observed
 #                              (black = unobserved) / each variant's
 #                              reconstruction at the final t), first
 #                              --gallery_n samples
 #   selected_patch_index/block_{b}_tmax_32_{variant}.json
-#                              duplicate-free observed index lists (8 per b;
+#                              duplicate-free observed index lists (10 per b;
 #                              new names avoid the old tmax=20)
 #
 # Calibration artifacts are produced separately by calibration_eval.py.
@@ -100,8 +131,11 @@ VARIANTS = [
     "raster",
     "raster_center",
     "ame",
+    "sigma_lookahead",
+    "sigma_lookahead_center",
 ]
 SIGMA_VARIANTS = ["sigma_greedy", "sigma_center"]
+LOOKAHEAD_VARIANTS = ["sigma_lookahead", "sigma_lookahead_center"]
 OUT_DIR = "images/rec_images_tmax32"
 
 ALL_PATCHES = list(range(144))
@@ -192,26 +226,33 @@ def ijepa_forward_batch(ijepa, img, context_indices_list):
     return sigmas, resid, pred_error
 
 
-def select_sigma(variant, ijepa, imgs, b, rng, device):
+def select_sigma(variant, ijepa, imgs, b, device, init_blocks):
     """sigma_greedy / sigma_center (model-based).
 
-    Returns (contexts per image [flat patch lists], observed-block steps)."""
+    init_blocks: the shared per-image random initial block (one flat patch
+    list per image; used by sigma_greedy, identical to the other
+    random-initial variants).
+
+    Also records, per image and state (t blocks observed), the sum of sigma
+    over the patches still unobserved (from the forward of that state);
+    NaN for steps an image never took (truncation / saturation), 0 for the
+    final fully-covered state.
+
+    Returns (contexts per image [flat patch lists], observed-block steps,
+             sigma_sum (N, max_steps) np)."""
     N = len(imgs)
     max_steps = 144 // (b * b)
 
     if variant == "sigma_center":
         init = center_window_patches(b)
         contexts = [list(init) for _ in range(N)]
-    else:  # sigma_greedy: random initial block (sliding anchor)
-        anchors = sliding_anchors(b)
-        contexts = []
-        for _ in range(N):
-            top, left = anchors[rng.integers(len(anchors))]
-            contexts.append(block_to_index(left, top, b, b))
+    else:  # sigma_greedy: the shared random initial block
+        contexts = [list(c) for c in init_blocks]
 
     img_t = torch.stack(imgs).to(device)
     active = list(range(N))
     steps = [1] * N
+    sig_sum = np.full((N, max_steps), np.nan, dtype=np.float64)
     step = 1
     while active and step < max_steps:
         batch = torch.stack([img_t[i] for i in active]).to(device)
@@ -234,6 +275,12 @@ def select_sigma(variant, ijepa, imgs, b, rng, device):
         bidx = torch.arange(len(active), device=sigmas.device)[:, None]
         ctx_tensor = torch.tensor(ctx, device=sigmas.device)
         sig_masked[bidx, ctx_tensor] = -torch.inf
+        # record: total sigma over the still-unobserved patches at this
+        # state (observed entries are -inf above); state t == step.
+        # sigmas carries a trailing unit dim -> sum over ALL trailing dims
+        sig_sum[np.asarray(active), step - 1] = torch.where(
+            torch.isfinite(sig_masked), sig_masked,
+            torch.zeros_like(sig_masked)).sum(dim=(1, 2)).cpu().numpy()
         pooled = F.avg_pool2d(sig_masked.reshape(len(active), 1, 12, 12),
                               kernel_size=b, stride=1)          # (A,1,H',W')
         A, _, Hp, Wp = pooled.shape
@@ -253,12 +300,21 @@ def select_sigma(variant, ijepa, imgs, b, rng, device):
         step += 1
         print(f"\r    {variant}: step {step}/{max_steps} "
               f"(active {len(active)}/{N})", end="", flush=True)
+    # images that observed every block: their last state has an empty
+    # unobserved set (sigma sum = 0, no choice was made)
+    for i in range(N):
+        if steps[i] == max_steps:
+            sig_sum[i, max_steps - 1] = 0.0
     print()
-    return contexts, steps
+    return contexts, steps, sig_sum
 
 
-def select_random(variant, b, rng, N):
+def select_random(variant, b, rng, N, init_blocks):
     """random_greedy / random_center (no model).
+
+    init_blocks: the shared per-image random initial block (one flat patch
+    list per image; used by random_greedy, identical to the other
+    random-initial variants).
 
     Returns (contexts per image [flat patch lists], observed-block steps)."""
     max_steps = 144 // (b * b)
@@ -271,16 +327,15 @@ def select_random(variant, b, rng, N):
                       for (top, left) in anchors]
     anchor_sets = [frozenset(p) for p in anchor_patches]
 
-    # NOTE: the rng draw pattern must stay exactly as before (one init draw
-    # per image for the greedy variants, then one draw per step taken from
-    # the valid anchors in anchor order) so seeded runs keep reproducing
-    # the very same selection sequences.
+    # NOTE: the rng draw pattern must stay exactly as before (one draw per
+    # step taken from the valid anchors in anchor order) so seeded runs keep
+    # reproducing the very same selection sequences. The initial block is no
+    # longer drawn here: every random-initial variant reuses the shared
+    # per-image draw made once in main().
     if variant == "random_center":
         init = [[center_window_patches(b)] for _ in range(N)]
-    else:  # random initial block
-        init = []
-        for _ in range(N):
-            init.append([list(anchor_patches[rng.integers(len(anchors))])])
+    else:  # random initial block (the shared draw)
+        init = [[block] for block in init_blocks]
 
     contexts, steps = [], []
     for i in range(N):
@@ -337,18 +392,229 @@ def select_deterministic(variant, b, N):
     return [list(flat) for _ in range(N)], [steps] * N
 
 
+def lookahead_forward(ijepa, img, context_indices_list):
+    """Standard I-JEPA pass for the CURRENT context (lookahead simulation).
+
+    Returns (sigmas (A,144), preds (A,144,D), context_features (A,t,D));
+    same math as ijepa_forward_batch() above, plus the pieces the candidate
+    simulation needs. sigmas/preds cover ALL 144 patch positions (as in the
+    reference implementations); the sigma map was verified bit-identical to
+    ijepa_forward_batch's."""
+    with torch.no_grad():
+        patches = ijepa.context_encoder.to_patch_embedding(img)
+        B = patches.size(0)
+
+        context_tensor = torch.tensor(context_indices_list, device=img.device)
+        context_features = ijepa.context_encoder(
+            patches, patchify=False, mask=context_tensor)
+
+        pos_emb = ijepa.context_encoder.pos_embedding.to(context_features.device)
+        context_features = context_features + pos_emb[context_tensor]
+
+        mask_tokens = ijepa.mask_token.expand(
+            B, len(ALL_PATCHES), -1).clone()
+        mask_tokens = mask_tokens + pos_emb
+
+        predictor_input = torch.cat([context_features, mask_tokens], dim=1)
+
+        mu_out = ijepa.mu_predictor(
+            predictor_input, patchify=False, pos_embed=False)
+        mu_out = F.layer_norm(mu_out, (mu_out.size(-1),))
+        preds = mu_out[:, -len(ALL_PATCHES):]
+
+        sigma_out = ijepa.sigma_predictor(
+            predictor_input, patchify=False, pos_embed=False)
+        sigmas = ijepa.sigma_predictor_head(sigma_out)
+        sigmas = sigmas[:, -len(ALL_PATCHES):].squeeze(-1)
+
+    return sigmas, preds, context_features
+
+
+def select_lookahead(variant, ijepa, imgs, b, device,
+                     m_cands=16, all_candidates=False, init_blocks=None):
+    """1-step lookahead sigma minimisation (sigma_lookahead / _center).
+
+    Instead of greedily taking the largest-current-sigma window, every
+    candidate is SIMULATED: its mu-predicted features (+pos emb) are appended
+    to the context as if observed, the sigma predictor maps the extended
+    context, and the candidate leaving the smallest total sigma over the
+    patches that would still be unobserved is chosen. Candidates are the
+    fully-unobserved sliding anchors (duplicate-free), pre-screened to the
+    top-M of the current pooled sigma (all_candidates=True simulates every
+    one).
+
+    init_blocks: the shared per-image random initial block (used by
+    sigma_lookahead; identical to the other random-initial variants).
+
+    Records per image along the way:
+      - sigma_sum[t]: sum of sigma over the patches still unobserved when t
+        blocks are in the context (from the standard forward of that state);
+        NaN for steps an image never takes (truncation / saturation), 0 for
+        the final fully-covered state.
+      - sigma_rank[t]: 1-based rank of the CHOSEN block in the valid anchors
+        sorted by the current (pooled) sigma, descending (1 = the block with
+        the largest sigma was selected; NaN when the image does not take
+        the step).
+
+    Returns (contexts per image, steps per image, sigma_sum (N,T) np,
+             sigma_rank (N,T) np)."""
+    N = len(imgs)
+    max_steps = 144 // (b * b)
+
+    anchors = sliding_anchors(b)
+    K = len(anchors)
+    anchor_patches = [block_to_index(left, top, b, b)
+                      for (top, left) in anchors]
+    anchor_blocks = torch.tensor(anchor_patches)           # (K, b*b)
+    anchor_bool = torch.zeros(K, len(ALL_PATCHES), dtype=torch.bool)
+    for k_idx, p in enumerate(anchor_patches):
+        anchor_bool[k_idx, p] = True
+
+    if variant == "sigma_lookahead_center":
+        contexts = [list(center_window_patches(b)) for _ in range(N)]
+    else:  # random initial block (the shared per-image draw)
+        contexts = [list(c) for c in init_blocks]
+
+    img_t = torch.stack(imgs).to(device)
+    active = list(range(N))
+    steps = [1] * N
+    sig_sum = np.full((N, max_steps), np.nan, dtype=np.float64)
+    sig_rank = np.full((N, max_steps), np.nan, dtype=np.float64)
+    k_cand = K if all_candidates else min(m_cands, K)
+    step = 1
+
+    while active and step < max_steps:
+        still = []
+        for c0, c1 in iter_chunks(len(active)):
+            act = active[c0:c1]
+            idx = torch.tensor(act, device=device)
+            batch = img_t[idx]
+            ctx = [contexts[i] for i in act]
+            A = batch.shape[0]
+            bb = b * b
+            t_now = len(ctx[0]) // bb          # equal for every active image
+            R = len(ALL_PATCHES) - t_now * bb - bb   # remaining count (const)
+
+            sigmas, preds, ctx_feats = lookahead_forward(ijepa, batch, ctx)
+
+            # observed-patch mask + validity of every anchor
+            ctx_idx = torch.tensor(ctx, device=device)
+            ctx_bool = torch.zeros(A, len(ALL_PATCHES), dtype=torch.bool,
+                                   device=device)
+            ctx_bool[torch.arange(A, device=device)[:, None], ctx_idx] = True
+            valid = ~torch.any(
+                ctx_bool[:, None, :] &
+                anchor_bool.to(device)[None, :, :], dim=-1)      # (A,K)
+
+            # prescreen: rank anchors by the pooled current sigma
+            sig_masked = sigmas.clone()
+            sig_masked[torch.arange(A, device=device)[:, None], ctx_idx] = \
+                -torch.inf
+            # record: total sigma over the still-unobserved patches at this
+            # state (observed entries masked to -inf above)
+            sig_sum[np.asarray(act), t_now - 1] = torch.where(
+                torch.isfinite(sig_masked), sig_masked,
+                torch.zeros_like(sig_masked)).sum(dim=1).cpu().numpy()
+            pooled = F.avg_pool2d(
+                sig_masked.reshape(A, 1, 12, 12),
+                kernel_size=b, stride=1).reshape(A, -1)          # (A,K)
+            order = torch.argsort(pooled, dim=1, descending=True, stable=True)
+            sel_idx = order[:, :k_cand]                          # (A,k_cand)
+
+            # any chosen anchor that is not fully-unobserved is replaced by
+            # the image's first valid anchor (dup: never wins, keeps the
+            # sequence layout uniform)
+            invalid_sel = ~valid.gather(1, sel_idx)
+            if invalid_sel.any():
+                first_valid = torch.argmax(valid.to(torch.int8), dim=1)
+                sel_idx = torch.where(invalid_sel,
+                                      first_valid[:, None], sel_idx)
+
+            rows = torch.nonzero(valid.any(dim=1)).squeeze(1)    # selectable
+            best_anchor = torch.full((A,), -1, dtype=torch.long,
+                                     device=device)
+            if rows.numel():
+                # chunks of (images x candidates) with <= CHUNK_SIZE rows per
+                # sigma-predictor call
+                pos_emb = ijepa.context_encoder.pos_embedding.to(device)
+                best_r = torch.full((rows.numel(),), -1, dtype=torch.long,
+                                    device=device)
+                sub = max(1, CHUNK_SIZE // k_cand)
+                for s0, s1 in iter_chunks(rows.numel(), chunk_size=sub):
+                    r = rows[s0:s1]
+                    A_r = r.numel()
+                    cand = anchor_blocks.to(device)[sel_idx[r]]  # (A_r,k,bb)
+                    cand = cand.sort(dim=-1).values              # ascending
+
+                    cand_bool = torch.zeros(A_r, k_cand, len(ALL_PATCHES),
+                                            dtype=torch.bool, device=device)
+                    cand_bool[torch.arange(A_r, device=device)[:, None, None],
+                              torch.arange(k_cand, device=device)[None, :, None],
+                              cand] = True
+                    remaining = ~(ctx_bool[r][:, None, :] | cand_bool)
+                    rem_pos = torch.sort(
+                        torch.where(
+                            remaining,
+                            torch.arange(len(ALL_PATCHES), device=device),
+                            len(ALL_PATCHES),
+                        ), dim=-1).values[..., :R]               # (A_r,k,R)
+
+                    i_rep = torch.arange(A_r, device=device).repeat_interleave(k_cand)
+                    cand_flat = cand.reshape(A_r * k_cand, bb)
+                    cand_feats = preds[r][i_rep[:, None], cand_flat]
+
+                    sim_in = torch.cat(
+                        [ctx_feats[r].repeat_interleave(k_cand, dim=0),
+                         cand_feats + pos_emb[cand_flat],
+                         (ijepa.mask_token.view(1, 1, 1, -1)
+                          + pos_emb[rem_pos]).reshape(A_r * k_cand, R, -1)],
+                        dim=1)                                   # (A_r*k,144,D)
+                    with torch.no_grad():
+                        sigma_out = ijepa.sigma_predictor(
+                            sim_in, patchify=False, pos_embed=False)
+                        sig_sim = ijepa.sigma_predictor_head(sigma_out)
+                        sig_sim = sig_sim.squeeze(-1)
+
+                    obj = sig_sim.sum(dim=1).reshape(A_r, k_cand)
+                    best_r[s0:s1] = obj.argmin(dim=1)
+                best_anchor[rows] = sel_idx[rows, best_r]
+                # record: the chosen block was the (best_r+1)-th largest
+                # pooled sigma among the valid anchors
+                sig_rank[np.asarray(act)[rows.cpu().numpy()], t_now - 1] = \
+                    (best_r + 1).cpu().numpy()
+
+            for row in range(A):
+                if best_anchor[row] < 0:
+                    continue        # truncation: no fully-unobserved anchor
+                i = act[row]
+                contexts[i].extend(anchor_patches[int(best_anchor[row])])
+                steps[i] += 1
+                still.append(i)
+        active = still
+        step += 1
+        print(f"\r    {variant}: step {step}/{max_steps} "
+              f"(active {len(active)}/{N})", end="", flush=True)
+    # images that observed every block: their last state has an empty
+    # unobserved set (sigma sum = 0, no choice was made)
+    for i in range(N):
+        if steps[i] == max_steps:
+            sig_sum[i, max_steps - 1] = 0.0
+    print()
+    return contexts, steps, sig_sum, sig_rank
+
+
 def select_ame_variant(model_mae, xs_norm, b, device, attention_layer,
-                       rng=None, random_first=True):
+                       rng=None, random_first=True, init_blocks=None):
     """ame: Attention-Map Entropy baseline (Pardyl et al., IJCAI 2023),
     MAE decoder attention; duplicate-free truncation like the other
     strategies (details in patch_selection_ame_eval.py).
 
-    The INITIAL b x b block is drawn uniformly at random from the valid
-    sliding anchors with the shared rng (same seed as the other
-    random-initial variants, sigma_greedy / random_greedy); the subsequent
-    blocks come from the attention-map entropy. Set random_first=False for
-    the official default instead (zero-step attention argmax, deterministic
-    and identical for every image).
+    The INITIAL b x b block is the SHARED per-image random draw
+    (init_blocks; identical to the other random-initial variants); the
+    subsequent blocks come from the attention-map entropy. Set
+    random_first=False and init_blocks=None for the official default
+    instead (zero-step attention argmax, deterministic and identical for
+    every image).
 
     The attention capture needs the timm attention modules of the MAE
     decoder to be patched; they are restored afterwards so every other
@@ -359,7 +625,8 @@ def select_ame_variant(model_mae, xs_norm, b, device, attention_layer,
     patch_attention_modules(model_mae)
     try:
         return select_ame(model_mae, xs_norm, b, device, attention_layer,
-                          random_first=random_first, rng=rng)
+                          random_first=random_first, rng=rng,
+                          init_blocks=init_blocks)
     finally:
         for block in model_mae.decoder.layers:
             attn_mod = block.attn
@@ -561,6 +828,12 @@ def main():
                         help='MAE decoder block whose attention drives the '
                              'AME selection (0-based; -1 = last decoder '
                              'block, as in the official AME)')
+    parser.add_argument('--M', type=int, default=16,
+                        help='lookahead: current-sigma top-M candidate '
+                             'prescreen (ignored with --all-candidates)')
+    parser.add_argument('--all-candidates', action='store_true',
+                        help='lookahead: simulate every fully-unobserved '
+                             'anchor (no prescreen; VERY slow for b=1)')
     parser.add_argument('--tlist', type=int, nargs='+', default=None,
                         help='observation step counts to sweep '
                              '(default: 1..aligned max t)')
@@ -636,7 +909,8 @@ def main():
         xs_norm.append(normalize(img))
     originals = {i: inv(xs_norm[i]).cpu() for i in range(n)}
     print(f'images: N={n} (start_index={args.start_index}), block sizes: '
-          f'{args.bs}, seed={args.seed}, device={device}')
+          f'{args.bs}, seed={args.seed}, device={device}, '
+          f'lookahead M={args.M} (all-candidates={args.all_candidates})')
 
     # models
     encoder = VisionTransformer(
@@ -668,25 +942,45 @@ def main():
         os.makedirs(b_dir, exist_ok=True)
         tile_total = 144 // (b * b)
 
+        # ---- ONE shared random-initial-block draw per image --------------- #
+        # every random-initial variant (sigma_greedy / random_greedy / ame /
+        # sigma_lookahead) reuses the same initial block for the same image,
+        # so the strategies are compared paired on the initialization luck;
+        # the per-step draws of random_greedy keep using the shared rng
+        anchors_b = sliding_anchors(b)
+        init_blocks = []
+        for _ in range(n):
+            top, left = anchors_b[rng.integers(len(anchors_b))]
+            init_blocks.append(block_to_index(left, top, b, b))
+
         # ---- selection sequences ---------------------------------------- #
         seqs, stops = {}, {}
+        sig_sums, sig_ranks = {}, {}     # per-image uncertainty recording
         for variant in VARIANTS:
             if variant in SIGMA_VARIANTS:
-                seqs[variant], stops[variant] = select_sigma(
-                    variant, ijepa, xs_raw, b, rng, device)
+                seqs[variant], stops[variant], sig_sums[variant] = \
+                    select_sigma(variant, ijepa, xs_raw, b, device,
+                                 init_blocks)
+            elif variant in LOOKAHEAD_VARIANTS:
+                (seqs[variant], stops[variant],
+                 sig_sums[variant], sig_ranks[variant]) = select_lookahead(
+                    variant, ijepa, xs_raw, b, device,
+                    m_cands=args.M, all_candidates=args.all_candidates,
+                    init_blocks=init_blocks)
             elif variant in ("random_greedy", "random_center"):
                 seqs[variant], stops[variant] = select_random(
-                    variant, b, rng, n)
+                    variant, b, rng, n, init_blocks)
             elif variant == "ame":
                 seqs[variant], stops[variant] = select_ame_variant(
-                    model.mae, xs_norm, b, device, attention_layer, rng)
+                    model.mae, xs_norm, b, device, attention_layer,
+                    init_blocks=init_blocks)
             else:
                 seqs[variant], stops[variant] = select_deterministic(
                     variant, b, n)
             print(f'  {variant}: steps min={min(stops[variant])}, '
                   f'max={max(stops[variant])}', flush=True)
 
-        # JSONs (8 per b: 7 sigma/random/fixed variants + AME, tmax_32 names)
+        # JSONs (10 per b, tmax_32 names)
         for variant in VARIANTS:
             jpath = os.path.join(
                 "selected_patch_index", f"block_{b}_tmax_32_{variant}.json")
@@ -761,6 +1055,34 @@ def main():
             "aligned_max_t": t_eval,
             "seed": args.seed,
         }, pt_path)
+        print(f'  saved: {pt_path}')
+
+        # ---- per-image uncertainty trajectories --------------------------- #
+        # sigma_sum: sum of sigma over the still-unobserved patches when t
+        # blocks are observed (sigma-based + lookahead variants; NaN past an
+        # image's truncation, 0 for a fully-covered final state)
+        # sigma_rank (lookahead only): 1-based rank of the chosen block among
+        # the valid anchors sorted by the current pooled sigma (descending)
+        traj_path = os.path.join(b_dir, "sigma_sum_traj.pt")
+        torch.save({
+            "results": {v: torch.tensor(sig_sums[v])
+                        for v in VARIANTS if v in sig_sums},
+            "sigma_rank": {v: torch.tensor(sig_ranks[v]) for v in sig_ranks},
+            "variants_recorded": [v for v in VARIANTS if v in sig_sums],
+            "block_size": b,
+            "max_steps": tile_total,
+            "n_images": n,
+            "seed": args.seed,
+            "sigma_sum_definition": "sum of sigma over the patches still "
+                                    "unobserved when t blocks are in the "
+                                    "context (NaN: the image stopped "
+                                    "before step t; 0: nothing unobserved)",
+            "sigma_rank_definition": "1-based rank of the chosen block "
+                                     "among the valid anchors sorted by the "
+                                     "current pooled sigma (descending); "
+                                     "NaN where no block was chosen",
+        }, traj_path)
+        print(f'  saved: {traj_path}')
 
         # ---- console summary ---------------------------------------------- #
         print_summary(results, t_list)
