@@ -107,6 +107,10 @@ def main():
                               '<variant>.json)'))
     parser.add_argument('--out_dir', type=str,
                         default='images/rec_images_tmax32')
+    parser.add_argument('--json_dir', type=str,
+                        default='selected_patch_index',
+                        help='where the block_{b}_tmax_32_{variant}.json '
+                             'files live (e.g. selected_patch_index/seed_0)')
     args = parser.parse_args()
 
     if args.device == 'cpu' or not torch.cuda.is_available():
@@ -137,8 +141,7 @@ def main():
         max_steps = 144 // (b * b)
         img_t = torch.stack(xs).to(device)
         for variant in args.variants:
-            jpath = os.path.join(
-                "selected_patch_index", f"block_{b}_tmax_32_{variant}.json")
+            jpath = os.path.join(args.json_dir, f"block_{b}_tmax_32_{variant}.json")
             if not os.path.isfile(jpath):
                 print(f'  [skip] {jpath} not found')
                 continue

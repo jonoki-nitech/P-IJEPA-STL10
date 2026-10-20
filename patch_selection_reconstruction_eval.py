@@ -78,12 +78,19 @@
 #                              (black = unobserved) / each variant's
 #                              reconstruction at the final t), first
 #                              --gallery_n samples
-#   selected_patch_index/block_{b}_tmax_32_{variant}.json
-#                              duplicate-free observed index lists (10 per b;
-#                              new names avoid the old tmax=20)
+#   {json_dir}/block_{b}_tmax_32_{variant}.json
+#                              duplicate-free observed index lists (one per
+#                              strategy run; new names avoid the old tmax=20)
+#                              {json_dir} defaults to selected_patch_index
+#                               (--json_dir, e.g. selected_patch_index/seed_0)
 #
 # Calibration artifacts are produced separately by calibration_eval.py.
-# Bundling into result.zip is intentionally left out (done later).
+# Bundling into per-seed result zips is done by revision/run.sh.
+#
+# Variant subsets: --variants takes any subset of the 10 strategies and
+# --lookahead-bs restricts the block sizes that run the (very slow for b=1)
+# lookahead variants (e.g. 2 3 4 to skip b=1). Strategies and block sizes
+# NOT in these filters are simply skipped; the rest is unaffected.
 #
 # MSE is measured in the inverse-normalized pixel domain, identical to
 # test_mae_on_selected_patches.py.
@@ -841,6 +848,19 @@ def main():
     parser.add_argument('--all-candidates', action='store_true',
                         help='lookahead: simulate every fully-unobserved '
                              'anchor (no prescreen; VERY slow for b=1)')
+    parser.add_argument('--variants', type=str, nargs='+', default=None,
+                        choices=VARIANTS, metavar='VARIANT',
+                        help='subset of strategies to run (default: all 10). '
+                             'Names: sigma_greedy sigma_center random_greedy '
+                             'random_center center_outward raster '
+                             'raster_center ame sigma_lookahead '
+                             'sigma_lookahead_center')
+    parser.add_argument('--lookahead-bs', type=int, nargs='+',
+                        default=[1, 2, 3, 4], metavar='B',
+                        help='block sizes for the lookahead variants '
+                             '(default: all; other block sizes then run '
+                             'without them, e.g. 2 3 4 to skip the very '
+                             'slow b=1 lookahead)')
     parser.add_argument('--tlist', type=int, nargs='+', default=None,
                         help='observation step counts to sweep '
                              '(default: 1..aligned max t)')
@@ -852,6 +872,11 @@ def main():
                              'final t) for the first this-many samples; '
                              '0 disables')
     parser.add_argument('--out_dir', type=str, default=OUT_DIR)
+    parser.add_argument('--json_dir', type=str,
+                        default='selected_patch_index',
+                        help='where to write the selection JSONs '
+                             '(block_{b}_tmax_32_{variant}.json); use e.g. '
+                             'selected_patch_index/seed_0 for per-seed runs')
     parser.add_argument(
         '--points_pt', type=str, default='',
         help='path to an existing rec_error_vs_t.pt; if set, the script does '
@@ -941,10 +966,20 @@ def main():
     print(f'MAE: dec_depth={model.mae.dec_depth}, '
           f'attention_layer={attention_layer} (AME selection)')
 
-    os.makedirs("selected_patch_index", exist_ok=True)
+    os.makedirs(args.json_dir, exist_ok=True)
+
+    # strategies to run (--variants subset; default all)
+    run_variants = list(VARIANTS) if args.variants is None \
+        else list(args.variants)
+    print(f'variants: {run_variants}')
+    print(f'lookahead block sizes: {args.lookahead_bs}')
 
     for b in args.bs:
         print(f'\n===== block size b = {b} =====')
+        # lookahead variants only run for the requested block sizes
+        variants_b = [v for v in run_variants
+                      if v not in LOOKAHEAD_VARIANTS
+                      or b in args.lookahead_bs]
         b_dir = os.path.join(args.out_dir, f"b{b}")
         os.makedirs(b_dir, exist_ok=True)
         tile_total = 144 // (b * b)
@@ -963,7 +998,7 @@ def main():
         # ---- selection sequences ---------------------------------------- #
         seqs, stops = {}, {}
         sig_sums, sig_ranks = {}, {}     # per-image uncertainty recording
-        for variant in VARIANTS:
+        for variant in variants_b:
             if variant in SIGMA_VARIANTS:
                 seqs[variant], stops[variant], sig_sums[variant] = \
                     select_sigma(variant, ijepa, xs_raw, b, device,
@@ -987,10 +1022,10 @@ def main():
             print(f'  {variant}: steps min={min(stops[variant])}, '
                   f'max={max(stops[variant])}', flush=True)
 
-        # JSONs (10 per b, tmax_32 names)
-        for variant in VARIANTS:
+        # JSONs (one per variant, tmax_32 names)
+        for variant in variants_b:
             jpath = os.path.join(
-                "selected_patch_index", f"block_{b}_tmax_32_{variant}.json")
+                args.json_dir, f"block_{b}_tmax_32_{variant}.json")
             with open(jpath, "w") as f:
                 json.dump(seqs[variant], f)
             print(f'  saved: {jpath}')
@@ -1000,10 +1035,10 @@ def main():
         # step t (saturation of one image would otherwise repeat the same
         # visible set and show as a flat segment); also leave at least one
         # patch unobserved so the unobserved-region MSE stays defined
-        variant_max_t = {v: min(stops[v]) for v in VARIANTS}
+        variant_max_t = {v: min(stops[v]) for v in variants_b}
         T_plot = min(t for t in [tile_total] + list(variant_max_t.values()))
         t_eval = min(T_plot, tile_total - 1)
-        dropped = [f"{v}(budget={variant_max_t[v]})" for v in VARIANTS
+        dropped = [f"{v}(budget={variant_max_t[v]})" for v in variants_b
                    if variant_max_t[v] > t_eval]
         print(f"aligned max t = {t_eval} "
               f"(truncated variants beyond their saturation: {dropped})",
@@ -1013,11 +1048,11 @@ def main():
         t_list = [t for t in t_list if t <= t_eval]
 
         # ---- MAE sweep over the common t axis ---------------------------- #
-        results = {v: np.zeros((len(t_list), n)) for v in VARIANTS}
+        results = {v: np.zeros((len(t_list), n)) for v in variants_b}
         gallery_on = args.gallery_n > 0
         gallery_cache = {"original": dict(originals), "observed": {}, "rec": {}}
 
-        for variant in VARIANTS:
+        for variant in variants_b:
             t_list_v, mse, final_gallery = evaluate_mae(
                 model, xs_norm, seqs[variant], b, device, inv, t_eval,
                 gallery_n=args.gallery_n, desc=f'b={b} {variant}')
@@ -1034,7 +1069,7 @@ def main():
 
         # ---- gallery PNGs (first samples, at the aligned final t) --------- #
         if gallery_on:
-            save_gallery_images(gallery_cache, VARIANTS, b_dir, b, t_list[-1])
+            save_gallery_images(gallery_cache, variants_b, b_dir, b, t_list[-1])
 
         # ---- plot --------------------------------------------------------- #
         title = (f"MAE reconstruction error vs t "
@@ -1047,13 +1082,13 @@ def main():
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["variant"] + [f"t={t}" for t in t_list])
-            for variant in VARIANTS:
+            for variant in variants_b:
                 mean = results[variant].mean(axis=1)
                 writer.writerow([variant] + [f"{m:.6f}" for m in mean])
 
         pt_path = os.path.join(b_dir, "rec_error_vs_t.pt")
         torch.save({
-            "results": {v: torch.tensor(results[v]) for v in VARIANTS},
+            "results": {v: torch.tensor(results[v]) for v in variants_b},
             "t_list": t_list,
             "block_size": b,
             "t_max": tile_total,
@@ -1073,9 +1108,9 @@ def main():
         traj_path = os.path.join(b_dir, "sigma_sum_traj.pt")
         torch.save({
             "results": {v: torch.tensor(sig_sums[v])
-                        for v in VARIANTS if v in sig_sums},
+                        for v in variants_b if v in sig_sums},
             "sigma_rank": {v: torch.tensor(sig_ranks[v]) for v in sig_ranks},
-            "variants_recorded": [v for v in VARIANTS if v in sig_sums],
+            "variants_recorded": [v for v in variants_b if v in sig_sums],
             "block_size": b,
             "max_steps": tile_total,
             "n_images": n,
