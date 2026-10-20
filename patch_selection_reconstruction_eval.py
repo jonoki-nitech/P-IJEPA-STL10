@@ -430,6 +430,89 @@ def lookahead_forward(ijepa, img, context_indices_list):
     return sigmas, preds, context_features
 
 
+def lookahead_simulate_candidates(ijepa, r, ctx_feats, preds, ctx_bool,
+                                  sel_idx, R, k_cand, b, device,
+                                  return_obj=False):
+    """Simulate every candidate of one (images x candidates) sub-chunk and
+    return the best one by total simulated sigma (1-step-lookahead objective).
+
+    This is the single implementation of the simulation math, shared by
+    select_lookahead() and by direct micro-tests. Behaviour is identical to
+    the previously inlined sub-chunk code of select_lookahead().
+
+    Inputs:
+      ijepa     the I-JEPA model (mask_token / sigma_predictor / head used)
+      r         (A_r,) image-row indices into the batch tensors below
+      ctx_feats (A,S,D) context features (+pos emb); S = observed patches
+      preds     (A,144,D) candidate mu-predicted features (from the same
+                state's lookahead_forward)
+      ctx_bool  (A,144) bool: True = currently observed
+      sel_idx   (A,k_cand) candidate anchor indices, prescreened & first-valid
+                substituted exactly as select_lookahead does
+      R         count of patches still unobserved AFTER adding a candidate
+                (0 at the final state: context + candidate already cover all
+                144 patches, so no mask-token segment is fed)
+      k_cand    candidates per image (columns of sel_idx)
+      b         block size
+
+    Returns (best_anchor (A_r,), best_r (A_r,)) with
+              best_anchor = sel_idx[r, best_r]
+    and, when return_obj=True, additionally the per-candidate simulated total
+    sigma (A_r,k_cand)."""
+    assert R == len(ALL_PATCHES) - ctx_feats[r].size(1) - b * b, \
+        "R must match the state in ctx_feats"
+
+    pos_emb = ijepa.context_encoder.pos_embedding.to(device)
+    anchor_blocks = torch.tensor(
+        [block_to_index(left, top, b, b) for (top, left) in sliding_anchors(b)])
+    A_r = r.numel()
+    bb = b * b
+    cand = anchor_blocks.to(device)[sel_idx[r]]  # (A_r,k,bb)
+    cand = cand.sort(dim=-1).values              # ascending
+
+    cand_bool = torch.zeros(A_r, k_cand, len(ALL_PATCHES),
+                            dtype=torch.bool, device=device)
+    cand_bool[torch.arange(A_r, device=device)[:, None, None],
+              torch.arange(k_cand, device=device)[None, :, None],
+              cand] = True
+    remaining = ~(ctx_bool[r][:, None, :] | cand_bool)
+    rem_pos = torch.sort(
+        torch.where(
+            remaining,
+            torch.arange(len(ALL_PATCHES), device=device),
+            len(ALL_PATCHES),
+        ), dim=-1).values[..., :R]               # (A_r,k,R)
+
+    i_rep = torch.arange(A_r, device=device).repeat_interleave(k_cand)
+    cand_flat = cand.reshape(A_r * k_cand, bb)
+    cand_feats = preds[r][i_rep[:, None], cand_flat]
+
+    sim_parts = [
+        ctx_feats[r].repeat_interleave(k_cand, dim=0),
+        cand_feats + pos_emb[cand_flat],
+    ]
+    if R > 0:
+        # remaining (still-unobserved) mask tokens; at the final state
+        # (t = max_steps - 1, e.g. b=1 at t=143) R = 0 and the context +
+        # candidate alone already make up all 144 tokens
+        sim_parts.append(
+            (ijepa.mask_token.view(1, 1, 1, -1)
+             + pos_emb[rem_pos]).reshape(A_r * k_cand, R, -1))
+    sim_in = torch.cat(sim_parts, dim=1)     # (A_r*k,144,D)
+    with torch.no_grad():
+        sigma_out = ijepa.sigma_predictor(
+            sim_in, patchify=False, pos_embed=False)
+        sig_sim = ijepa.sigma_predictor_head(sigma_out)
+        sig_sim = sig_sim.squeeze(-1)
+
+    obj = sig_sim.sum(dim=1).reshape(A_r, k_cand)
+    best_r = obj.argmin(dim=1)                            # (A_r,)
+    best_anchor = sel_idx[r, best_r]
+    if return_obj:
+        return best_anchor, best_r, obj
+    return best_anchor, best_r
+
+
 def select_lookahead(variant, ijepa, imgs, b, device,
                      m_cands=16, all_candidates=False, init_blocks=None):
     """1-step lookahead sigma minimisation (sigma_lookahead / _center).
@@ -536,48 +619,16 @@ def select_lookahead(variant, ijepa, imgs, b, device,
             if rows.numel():
                 # chunks of (images x candidates) with <= CHUNK_SIZE rows per
                 # sigma-predictor call
-                pos_emb = ijepa.context_encoder.pos_embedding.to(device)
                 best_r = torch.full((rows.numel(),), -1, dtype=torch.long,
-                                    device=device)
+                                     device=device)
                 sub = max(1, CHUNK_SIZE // k_cand)
                 for s0, s1 in iter_chunks(rows.numel(), chunk_size=sub):
                     r = rows[s0:s1]
-                    A_r = r.numel()
-                    cand = anchor_blocks.to(device)[sel_idx[r]]  # (A_r,k,bb)
-                    cand = cand.sort(dim=-1).values              # ascending
-
-                    cand_bool = torch.zeros(A_r, k_cand, len(ALL_PATCHES),
-                                            dtype=torch.bool, device=device)
-                    cand_bool[torch.arange(A_r, device=device)[:, None, None],
-                              torch.arange(k_cand, device=device)[None, :, None],
-                              cand] = True
-                    remaining = ~(ctx_bool[r][:, None, :] | cand_bool)
-                    rem_pos = torch.sort(
-                        torch.where(
-                            remaining,
-                            torch.arange(len(ALL_PATCHES), device=device),
-                            len(ALL_PATCHES),
-                        ), dim=-1).values[..., :R]               # (A_r,k,R)
-
-                    i_rep = torch.arange(A_r, device=device).repeat_interleave(k_cand)
-                    cand_flat = cand.reshape(A_r * k_cand, bb)
-                    cand_feats = preds[r][i_rep[:, None], cand_flat]
-
-                    sim_in = torch.cat(
-                        [ctx_feats[r].repeat_interleave(k_cand, dim=0),
-                         cand_feats + pos_emb[cand_flat],
-                         (ijepa.mask_token.view(1, 1, 1, -1)
-                          + pos_emb[rem_pos]).reshape(A_r * k_cand, R, -1)],
-                        dim=1)                                   # (A_r*k,144,D)
-                    with torch.no_grad():
-                        sigma_out = ijepa.sigma_predictor(
-                            sim_in, patchify=False, pos_embed=False)
-                        sig_sim = ijepa.sigma_predictor_head(sigma_out)
-                        sig_sim = sig_sim.squeeze(-1)
-
-                    obj = sig_sim.sum(dim=1).reshape(A_r, k_cand)
-                    best_r[s0:s1] = obj.argmin(dim=1)
-                best_anchor[rows] = sel_idx[rows, best_r]
+                    chunk_anchor, chunk_best = lookahead_simulate_candidates(
+                        ijepa, r, ctx_feats, preds, ctx_bool, sel_idx,
+                        R, k_cand, b, device)
+                    best_anchor[r] = chunk_anchor
+                    best_r[s0:s1] = chunk_best
                 # record: the chosen block was the (best_r+1)-th largest
                 # pooled sigma among the valid anchors
                 sig_rank[np.asarray(act)[rows.cpu().numpy()], t_now - 1] = \
