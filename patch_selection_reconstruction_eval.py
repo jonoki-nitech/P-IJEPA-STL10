@@ -939,7 +939,12 @@ def main():
         img, _ = stl10_ds[i]
         xs_raw.append(img)
         xs_norm.append(normalize(img))
-    originals = {i: inv(xs_norm[i]).cpu() for i in range(n)}
+    # originals are only needed for the gallery (the first --gallery_n
+    # samples); keep the key set identical to the observed/rec gallery
+    # cache (which is also built only for the first --gallery_n samples),
+    # otherwise save_gallery_images hits a KeyError for N > gallery_n
+    n_gallery = min(args.gallery_n, n)
+    originals = {i: inv(xs_norm[i]).cpu() for i in range(n_gallery)}
     print(f'images: N={n} (start_index={args.start_index}), block sizes: '
           f'{args.bs}, seed={args.seed}, device={device}, '
           f'lookahead M={args.M} (all-candidates={args.all_candidates})')
