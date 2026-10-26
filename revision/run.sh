@@ -23,6 +23,10 @@
 #     training_model.pth          full I-JEPA state dict (sigma keys included,
 #                                 untrained -- overwritten every log period)
 #     encoder.pth                 target-encoder state dict (EMA)
+#     result.zip                  packed at the end of the run: the save
+#                                 directory's contents, stored under
+#                                 mcdropout_embdim=.../training_model.pth etc.
+#                                 (SKIP_ZIP=1 disables packaging)
 #   NOTE: the default save directory differs from the probabilistic
 #   embdim=512_epoch=300_patchsize=8 so the sigma-based checkpoints are
 #   NEVER overwritten; pass -save_model_dir to change it.
@@ -45,6 +49,8 @@
 #     SAVE_DIR=./models/xx ...         # -save_model_dir
 #     CKPT=path/training_model.pth ... # resume training
 #     SMOKE=1 ...                      # 1-epoch, every-1-step sanity run
+#     SKIP_ZIP=1 ...                   # skip the final result.zip
+#     ZIP=result.zip ...               # zip base name
 #
 #   The STL10 data is resolved by data_utils.py (auto-detected server
 #   directory, otherwise streamed into data/stl10_binary/).
@@ -114,12 +120,36 @@ $PY run_training_mcdropout.py \
     $CKPT_FLAGS
 
 # -----------------------------------------------------------------------------
+# Package the artefacts into result.zip
+# -----------------------------------------------------------------------------
+if [ "${SKIP_ZIP:-0}" != "1" ]; then
+    INFIX=$(basename "$SAVE_DIR")
+    ZIP="${ZIP:-result.zip}"
+    echo ""
+    echo "=== Pack artefacts into $ZIP ===================================="
+    rm -f "$ZIP"
+    "$PY" - "$ZIP" "$SAVE_DIR" "$INFIX" <<'PYEOF'
+import os, sys, zipfile
+zip_name, save_dir, infix = sys.argv[1], sys.argv[2], sys.argv[3]
+with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
+    for dirpath, _, files in os.walk(save_dir):
+        for f in files:
+            src = os.path.join(dirpath, f)
+            dst = os.path.join(infix, os.path.relpath(src, save_dir))
+            zf.write(src, dst)
+print(f"created: {zip_name} ({os.path.getsize(zip_name) / 1e6:.1f} MB, "
+      f"from {save_dir})")
+PYEOF
+fi
+
+# -----------------------------------------------------------------------------
 # Summary of the produced artefacts
 # -----------------------------------------------------------------------------
 echo ""
 echo "=== Done. Produced artefacts ======================================"
 ls -l "$SAVE_DIR"/training_model.pth "$SAVE_DIR"/encoder.pth 2>/dev/null \
     || echo "(missing artefacts in $SAVE_DIR)"
+ls "${ZIP:-result.zip}" 2>/dev/null || true
 echo ""
 echo "NOTE: the sigma-predictor in this checkpoint is untrained --"
 echo "      do NOT run the sigma-based strategies with it."

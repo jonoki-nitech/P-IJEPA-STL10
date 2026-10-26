@@ -26,3 +26,4 @@ DEVICE=cuda:1 bash revision/run.sh 2>&1 | tee train_mcdropout.log
 | ---------------------------------- | ---------------------------------------------------------------------- |
 | 学習済みI-JEPA(σキー込み・σ未学習) | `models/mcdropout_embdim=512_epoch=300_patchsize=8/training_model.pth` |
 | target encoder(EMA)                | `models/mcdropout_embdim=512_epoch=300_patchsize=8/encoder.pth`        |
+| 上記をまとめたzip(実行終了時に自動生成) | `result.zip`(リポジトリ直下)                                      |
