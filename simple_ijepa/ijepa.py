@@ -20,7 +20,8 @@ class IJEPA(torch.nn.Module):
                  patch_size=8,
                  num_targets=4,
                  predictor_depth=6,
-                 predictor_heads=6):
+                 predictor_heads=6,
+                 mu_dropout=0.):
         super(IJEPA, self).__init__()
 
         self.patch_size = patch_size
@@ -32,12 +33,16 @@ class IJEPA(torch.nn.Module):
         self.target_encoder = copy.deepcopy(self.context_encoder)
         self.target_encoder.requires_grad_(False)
 
+        # dropout is only carried by the mu-predictor (for MC-Dropout
+        # uncertainty estimation at inference; keep=0. means no dropout),
+        # all other modules are built without dropout
         self.mu_predictor = VisionTransformer(image_size=96,
                                            patch_size=patch_size,
                                            dim=hidden_emb_dim,
                                            depth=predictor_depth,
                                            heads=predictor_heads,
-                                           mlp_dim=hidden_emb_dim * 2)
+                                           mlp_dim=hidden_emb_dim * 2,
+                                           dropout=mu_dropout)
         
         self.sigma_predictor = VisionTransformer(image_size=96,
                                            patch_size=patch_size,

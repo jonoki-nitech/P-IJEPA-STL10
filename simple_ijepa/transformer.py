@@ -20,8 +20,12 @@ def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype=torch.float32):
 
 
 class FeedForward(nn.Module):
+    """As before, with an optional Dropout added AFTER the GELU and the
+    output Linear (as plain submodules, NOT inside the Sequential, so the
+    parameter indices -- and therefore existing checkpoints -- stay
+    unchanged)."""
 
-    def __init__(self, dim, hidden_dim):
+    def __init__(self, dim, hidden_dim, dropout=0.):
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(dim),
@@ -29,14 +33,20 @@ class FeedForward(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, dim),
         )
+        self.drop1 = nn.Dropout(dropout)
+        self.drop2 = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.net(x)
+        for layer in self.net[:-1]:
+            x = layer(x)
+        x = self.drop1(x)
+        x = self.net[-1](x)
+        return self.drop2(x)
 
 
 class Attention(nn.Module):
 
-    def __init__(self, dim, heads=8, dim_head=64):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.):
         super().__init__()
         inner_dim = dim_head * heads
         self.heads = heads
@@ -48,6 +58,12 @@ class Attention(nn.Module):
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
         self.to_out = nn.Linear(inner_dim, dim, bias=False)
 
+        # dropout on the attention probabilities and the output projection
+        # (plain submodules without parameters, so existing checkpoints
+        # keep loading strictly)
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(dropout)
+
     def forward(self, x):
         x = self.norm(x)
 
@@ -57,24 +73,25 @@ class Attention(nn.Module):
 
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
 
-        attn = self.attend(dots)
+        attn = self.attn_drop(self.attend(dots))
 
         out = torch.matmul(attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
+        return self.proj_drop(self.to_out(out))
 
 
 class Transformer(nn.Module):
 
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout=0.):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(
                 nn.ModuleList([
-                    Attention(dim, heads=heads, dim_head=dim_head),
-                    FeedForward(dim, mlp_dim)
+                    Attention(dim, heads=heads, dim_head=dim_head,
+                              dropout=dropout),
+                    FeedForward(dim, mlp_dim, dropout=dropout)
                 ]))
 
     def forward(self, x):
@@ -95,7 +112,8 @@ class VisionTransformer(nn.Module):
                  heads,
                  mlp_dim,
                  channels=3,
-                 dim_head=64):
+                 dim_head=64,
+                 dropout=0.):
         super().__init__()
         image_height, image_width = image_size, image_size
         patch_height, patch_width = patch_size, patch_size
@@ -120,7 +138,8 @@ class VisionTransformer(nn.Module):
         )
         self.pos_embedding.requires_grad_(False)
 
-        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim)
+        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim,
+                                       dropout=dropout)
 
     def forward(self, x, patchify=True, pos_embed=True, mask=None):
         device = x.device
