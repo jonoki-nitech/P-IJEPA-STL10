@@ -31,6 +31,14 @@
 #   python sigma_uncertainty_traj.py --N 5 --bs 1 2                  (smoke)
 #   python sigma_uncertainty_traj.py --bs 1 2 3 4                    (full)
 #   ... --variants sigma_greedy sigma_center (default)
+#   ... --variants mc_greedy mc_center \
+#       --model_path models/mcdropout_embdim=512_epoch=300_patchsize=8/training_model.pth \
+#       --json_dir selected_patch_index/mcdropout/seed_0 \
+#       --out_dir images/rec_images_mcdropout
+# (mc_* variants replay with --mc-samples dropout-enabled mu-predictor
+# forwards; the recorded quantity is then the sum of the pooled MC variance
+# over the unobserved patches — variance units, NOT comparable numerically
+# to the sigma-head sums)
 # Note: one batched forward per (variant, t), so the cost is the same as one
 # sigma-selection sweep (~15 min per variant for b=1 on a GPU at N=8000).
 
@@ -55,11 +63,14 @@ from patch_selection_reconstruction_eval import (
 )
 
 
-def replay_sigma_sums(ijepa, img_t, contexts_flats, b, device, desc):
-    """Replay the stored sequences and record the sigma sums.
+def replay_sigma_sums(ijepa, img_t, contexts_flats, b, device, desc,
+                      mc_samples=1):
+    """Replay the stored sequences and record the uncertainty sums.
 
     contexts_flats: per image, the flat patch list (prefix t = first t*b^2
-    patches). Returns (n, max_steps) float64 array with NaN padding."""
+    patches). Returns (n, max_steps) float64 array with NaN padding. With
+    mc_samples = K > 1 the recorded quantity is the sum of the pooled MC
+    variance (ibid. patch_selection_reconstruction_eval.py)."""
     N = len(contexts_flats)
     max_steps = 144 // (b * b)
     steps = [len(c) // (b * b) for c in contexts_flats]
@@ -75,7 +86,8 @@ def replay_sigma_sums(ijepa, img_t, contexts_flats, b, device, desc):
             batch = img_t[idx]
             ctx = [contexts_flats[i][:(t * b * b)] for i in act]
             with torch.no_grad():
-                sigmas, _, _ = ijepa_forward_batch(ijepa, batch, ctx)
+                sigmas, _, _ = ijepa_forward_batch(
+                    ijepa, batch, ctx, mc_samples=mc_samples)
             sig = sigmas.squeeze(-1)                     # (A, 144)
             ctx_idx = torch.tensor(ctx, device=device)
             mask = torch.ones(batch.shape[0], len(ALL_PATCHES),
@@ -103,8 +115,21 @@ def main():
     parser.add_argument('--variants', type=str, nargs='+',
                         default=['sigma_greedy', 'sigma_center'],
                         help=('selection JSON variants to replay (files '
-                              'selected_patch_index/block_{b}_tmax_32_'
-                              '<variant>.json)'))
+                              '<json_dir>/block_{b}_tmax_32_'
+                              '<variant>.json); mc_* variants replay with '
+                              '--mc-samples dropout forwards'))
+    parser.add_argument('--mc-samples', type=int, default=16,
+                        help='number of dropout-enabled mu-predictor '
+                             'forwards used by mc_* variants (default: 16; '
+                             'sigma_* variants always use the sigma head)')
+    parser.add_argument('--mc-seed', type=int, default=0,
+                        help='torch seed for the mc_* dropout samples')
+    parser.add_argument('--mu-dropout', type=float, default=0.1,
+                        help='dropout probability of the mu-predictor '
+                             'modules passed to the IJEPA constructor '
+                             '(0.1 = the MC-Dropout baseline config; '
+                             'irrelevant for the sigma model, whose '
+                             'modules always run in eval mode)')
     parser.add_argument('--out_dir', type=str,
                         default='images/rec_images_tmax32')
     parser.add_argument('--json_dir', type=str,
@@ -129,10 +154,12 @@ def main():
     encoder = VisionTransformer(
         image_size=96, patch_size=8, dim=512, depth=6, heads=6, mlp_dim=1024,
     ).to(device)
-    ijepa = IJEPA(encoder, hidden_emb_dim=512, patch_size=8, num_targets=1)
+    ijepa = IJEPA(encoder, hidden_emb_dim=512, patch_size=8, num_targets=1,
+                  mu_dropout=args.mu_dropout)
     ijepa.load_state_dict(torch.load(args.model_path, map_location=device))
     ijepa = ijepa.to(device)
     ijepa.eval()
+    torch.manual_seed(args.mc_seed)
 
     for b in args.bs:
         print(f'\n===== block size b = {b} (uncertainty trajectories) =====')
@@ -152,12 +179,16 @@ def main():
                       f'not N={n}')
                 continue
             kept_variants.append(variant)
+            mc_samples = (args.mc_samples
+                          if variant.startswith("mc_") else 1)
             results[variant] = replay_sigma_sums(
                 ijepa, img_t, contexts, b, device,
-                desc=f'  {variant} b={b} (t=1..{max_steps})')
+                desc=f'  {variant} b={b} (t=1..{max_steps})',
+                mc_samples=mc_samples)
 
         if not kept_variants:
             continue
+        mc_only = all(v.startswith("mc_") for v in kept_variants)
         out_path = os.path.join(b_dir, "sigma_sum_traj.pt")
         torch.save({
             "results": {v: torch.tensor(results[v]) for v in kept_variants},
@@ -165,10 +196,17 @@ def main():
             "block_size": b,
             "t_max": max_steps,
             "n_images": n,
-            "definition": ("sum of sigma over the patches still unobserved "
-                           "when t blocks (of the stored selection sequence) "
-                           "are in the context; NaN = the image never took "
-                           "step t, 0 = nothing unobserved"),
+            "definition": (
+                "sum of the pooled MC-dropout prediction variance over the "
+                "patches still unobserved when t blocks (of the stored "
+                "selection sequence) are in the context; NaN = the image "
+                "never took step t, 0 = nothing unobserved (variance units, "
+                "NOT directly comparable to sigma-head sums)"
+                if mc_only else
+                "sum of sigma over the patches still unobserved "
+                "when t blocks (of the stored selection sequence) "
+                "are in the context; NaN = the image never took "
+                "step t, 0 = nothing unobserved"),
         }, out_path)
         print(f'  saved: {out_path}')
 

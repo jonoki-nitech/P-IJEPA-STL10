@@ -1,21 +1,29 @@
-# Calibration evaluation for the sigma (uncertainty) head of Probabilistic I-JEPA (STL10).
+# Calibration evaluation for the sigma (uncertainty) head of Probabilistic I-JEPA (STL10),
+# or for the MC-Dropout uncertainty of the mu-dropout baseline.
 # Adapted from uncertainty_eval.py: inference loop is shared with it.
 #
-# What this script measures (sigma is treated as a pooled variance v per patch,
-# following the training loss e/v + log(v)):
-#   1. Reliability (calibration) diagram: equal-count bins by sigma, comparing
+# What this script measures (the uncertainty is treated as a pooled variance
+# v per patch — for the sigma head, following the training loss e/v + log(v);
+# for MC-Dropout it IS the pooled MC prediction variance):
+#   1. Reliability (calibration) diagram: equal-count bins by v, comparing
 #      mean predicted v vs mean squared residual per bin, with the y=x reference.
 #   2. Scalar diagnostics: Pearson / Spearman, mean(e)/mean(v), mean(e/v),
 #      log-log regression of error on sigma (calibrated <=> intercept 0, slope 1).
 #   3. Proper scoring rule comparisons (mean NLL over patches):
-#      - our sigma            (heteroscedastic prediction)
+#      - our sigma (or pooled MC variance)  (heteroscedastic prediction)
 #      - homoscedastic baseline (single global variance = mean residual)
 #      - shuffled sigma       (same marginal distribution, pairing destroyed)
 #   4. Per-dimension 95% coverage: fraction of |residual_d| <= 1.96 * sqrt(v).
 #
 # Two modes:
 #   A) inference mode (default): runs the model over --N images and --positions,
-#      collects (sigma, pred_error) per unobserved patch, then analyzes.
+#      collects (uncertainty, pred_error) per unobserved patch, then analyzes.
+#      With --mc-samples K > 1, the mu predictor runs K dropout-enabled
+#      forwards (encoders in eval mode): the recorded uncertainty is the
+#      per-patch mean over feature dims of the per-dim K-sample prediction
+#      variance (variance units, no sqrt), and pred_error comes from the
+#      K-sample mean prediction. Use --out_dir <dir>_mcdropout to keep the
+#      artifact sets separate from the sigma-model runs.
 #   B) analysis-only mode (--points_pt <path>): skips model loading / dataset /
 #      inference entirely and analyzes previously saved calibration_points.pt.
 #      The input .pt is never overwritten in this mode.
@@ -42,6 +50,7 @@ from torchvision import transforms
 from data_utils import load_stl10
 from simple_ijepa.transformer import VisionTransformer
 from simple_ijepa.ijepa import IJEPA
+from simple_ijepa.mc_dropout import mc_predict, mu_has_dropout
 
 
 def block_to_index(left, top, w, h):
@@ -242,6 +251,20 @@ def main():
         '--bins', type=int, default=10,
         help='number of equal-count bins for the reliability diagram')
     parser.add_argument(
+        '--mc-samples', type=int, default=1,
+        help='MC-Dropout mode when K > 1: use the pooled K-sample prediction '
+             'variance of the dropout-enabled mu predictor as the recorded '
+             'uncertainty (default: 1 = the sigma head of the loaded model)')
+    parser.add_argument(
+        '--mc-seed', type=int, default=0,
+        help='torch seed for the MC dropout samples (inference mode only)')
+    parser.add_argument(
+        '--mu-dropout', type=float, default=0.1,
+        help='dropout probability of the mu-predictor modules passed to '
+             'the IJEPA constructor (0.1 = the MC-Dropout baseline config; '
+             'irrelevant for the sigma model, whose modules always run in '
+             'eval mode)')
+    parser.add_argument(
         '--include_context', action='store_true',
         help='keep patches inside the observed block (default: excluded, '
              'matching the training target condition)')
@@ -314,7 +337,8 @@ def main():
     ijepa = IJEPA(encoder,
                 hidden_emb_dim=512,
                 patch_size=8,
-                num_targets=1)
+                num_targets=1,
+                mu_dropout=args.mu_dropout)
 
     state_dict = torch.load(args.model_path, map_location=device)
     ijepa.load_state_dict(state_dict)
@@ -322,6 +346,13 @@ def main():
 
     # inference
     ijepa.eval()
+
+    if args.mc_samples > 1:
+        assert mu_has_dropout(ijepa), (
+            f"--mc-samples {args.mc_samples} requires dropout inside "
+            f"ijepa.mu_predictor (an MC-Dropout checkpoint); "
+            f"{args.model_path} has none")
+        torch.manual_seed(args.mc_seed)
 
     positions = []
     for pos in args.positions:
@@ -392,18 +423,24 @@ def main():
 
                     # Concat context_features and mask_tokens, obtain predictions
                     predictor_input = torch.cat([context_features, mask_tokens], dim=1)
-                    predictor_output = ijepa.mu_predictor(
-                        predictor_input, patchify=False, pos_embed=False)
 
-                    predictor_output = torch.nn.functional.layer_norm(
-                        predictor_output, (predictor_output.size(-1),))
-                    preds = predictor_output[:, -min_target_size:]
+                    if args.mc_samples > 1:
+                        preds, sigmas = mc_predict(
+                            ijepa, predictor_input, min_target_size,
+                            args.mc_samples)
+                    else:
+                        predictor_output = ijepa.mu_predictor(
+                            predictor_input, patchify=False, pos_embed=False)
 
-                    sigma_predictor_output = ijepa.sigma_predictor(
-                        predictor_input, patchify=False, pos_embed=False)
-                    sigma_predictor_output = ijepa.sigma_predictor_head(
-                        sigma_predictor_output)
-                    sigmas = sigma_predictor_output[:, -min_target_size:]
+                        predictor_output = torch.nn.functional.layer_norm(
+                            predictor_output, (predictor_output.size(-1),))
+                        preds = predictor_output[:, -min_target_size:]
+
+                        sigma_predictor_output = ijepa.sigma_predictor(
+                            predictor_input, patchify=False, pos_embed=False)
+                        sigma_predictor_output = ijepa.sigma_predictor_head(
+                            sigma_predictor_output)
+                        sigmas = sigma_predictor_output[:, -min_target_size:]
 
                     targets = torch.stack(
                         [target_features[i, target_indices_list[i][j], :]
@@ -442,7 +479,9 @@ def main():
     }
 
     analyze(sigma_arr, err_arr, args.bins, args.out_dir, meta,
-            save_points=True, source_note='inference')
+            save_points=True,
+            source_note=(f'inference (mc_samples={args.mc_samples})'
+                         if args.mc_samples > 1 else 'inference'))
 
     # raw points incl. ids for later analysis (unchanged format + ids)
     torch.save({
@@ -455,6 +494,7 @@ def main():
         'include_context': args.include_context,
         'coverage_count': cover_count,
         'coverage_total': cover_total,
+        'mc_samples': args.mc_samples,
     }, os.path.join(args.out_dir, 'calibration_points.pt'))
 
 

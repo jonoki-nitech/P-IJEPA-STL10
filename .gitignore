@@ -9,7 +9,9 @@ data/
 # --- experiment outputs / artefacts ---
 images/
 selected_patch_index/
+init_blocks/
 result.zip
+result_*.zip
 results/
 
 # --- caches / logs / temporary files ---
@@ -18,6 +20,7 @@ __pycache__/
 *.pyo
 *.log
 tmp.png
+tmp_*/
 README_old.md
 
 # --- OS / editor ---
