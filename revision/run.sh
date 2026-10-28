@@ -32,10 +32,10 @@
 #         gallery/nXXXX.png (first --gallery_n samples)
 #     selected_patch_index/mcdropout/seed_{s}/block_{b}_tmax_32_{variant}.json
 #     init_blocks/seed_{s}.pt (shared init blocks, reproduced from the old run)
-#     result_mcdropout_seed_{s}.zip   packed at the end of the seed's run
+#     result_seed_{s}.zip   packed at the end of the seed's run
 #                                     (the seed's artefacts + the shared
 #                                     calibration + the init blocks pt)
-#     result_mcdropout.zip            bundles all seed zips (nested, stored
+#     result.zip            bundles all seed zips (nested, stored
 #                                     without re-compression)
 #
 #   Strategies (default VARIANTS_LIST = mc_greedy + mc_lookahead):
@@ -103,7 +103,15 @@
 #     SKIP_CALIB=1 ...                           # skip Step 0
 #     SKIP_ZIP=1 ...                             # skip packaging (the per-seed
 #                                                #  zips AND their result zip)
-#     ZIP_PREFIX=result_mcdropout ...            # zip base name
+#     ZIP_PREFIX=result_mcdropout ...            # zip base name (default: result
+#                                                #  -> result_seed_{s}.zip + a
+#                                                #  nested result.zip; the default
+#                                                #  OVERWRITES the training
+#                                                #  result.zip of
+#                                                #  run_mcdropout_train.sh, which is
+#                                                #  fine now that it is backed up:
+#                                                #  pass a different ZIP_PREFIX to
+#                                                #  keep both e.g. result_mcdropout)
 #
 #   Runtime at N=8000, K=16 (24 GB GPU): roughly a day per seed, dominated
 #   by the 1-step lookahead (MC_K x M candidate simulations per step; the old
@@ -257,7 +265,7 @@ for SEED in $SEEDS; do
     # init blocks) into one zip
     # -------------------------------------------------------------------------
     if [ "${SKIP_ZIP:-0}" != "1" ]; then
-        ZIP="${ZIP_PREFIX:-result_mcdropout}_${SEED_DIR}.zip"
+        ZIP="${ZIP_PREFIX:-result}_${SEED_DIR}.zip"
         echo ""
         echo "=== Pack artefacts into $ZIP ===================================="
         rm -f "$ZIP"
@@ -285,11 +293,11 @@ done
 # stored as-is, without re-compression)
 # -----------------------------------------------------------------------------
 if [ "${SKIP_ZIP:-0}" != "1" ]; then
-    RESULT_ZIP="${ZIP_PREFIX:-result_mcdropout}.zip"
+    RESULT_ZIP="${ZIP_PREFIX:-result}.zip"
     echo ""
     echo "=== Bundle per-seed zips into $RESULT_ZIP ======================="
     rm -f "$RESULT_ZIP"
-    "$PY" - "$RESULT_ZIP" "${ZIP_PREFIX:-result_mcdropout}_seed_" "$SEEDS" <<'PYEOF'
+    "$PY" - "$RESULT_ZIP" "${ZIP_PREFIX:-result}_seed_" "$SEEDS" <<'PYEOF'
 import os, sys, zipfile
 result_zip, prefix, seeds = sys.argv[1], sys.argv[2], sys.argv[3]
 seed_zips = [f"{prefix}{s}.zip" for s in seeds.split()]

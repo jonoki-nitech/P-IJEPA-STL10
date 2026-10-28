@@ -29,3 +29,4 @@ DEVICE=cuda:1 bash revision/run.sh 2>&1 | tee eval_mcdropout.log
 | calibration                    | `images/calibration_mcdropout/calibration_points.pt`(ほか既存形式と同一)      |
 | 旧σモデルとの比較オーバレイ    | `images/compare_sigma_vs_mcdropout/rec_error_vs_t.compare.{png,pt}`           |
 | 旧実験から復元した初期ブロック | `init_blocks/seed_{s}.pt`(`--init-blocks-pt`で入力、成果物というより共有素材) |
+| まとめzip(実行終了時に自動生成) | `result_seed_{s}.zip` ×5 + ネスト収納した`result.zip`(学習時の`result.zip`を上書き) |
