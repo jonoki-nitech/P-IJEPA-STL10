@@ -64,3 +64,17 @@ python patch_selection_reconstruction_eval.py \
 | 旧σモデルとの比較オーバレイ    | `images/compare_sigma_vs_mcdropout/rec_error_vs_t.compare.{png,pt}`           |
 | 旧実験から復元した初期ブロック | `init_blocks/seed_{s}.pt`(`--init-blocks-pt`で入力、成果物というより共有素材) |
 | まとめzip(実行終了時に自動生成) | `result_seed_{s}.zip` ×5 + ネスト収納した`result.zip`(学習時の`result.zip`を上書き) |
+
+### サンプリングlookahead実験(`sigma_lookahead_sample`)の成果物
+
+| 成果物                 | 保存先                                                                              |
+| ---------------------- | ------------------------------------------------------------------------------------ |
+| 選択シーケンス         | `selected_patch_index/sigmasample/seed_{s}/block_{b}_tmax_32_sigma_lookahead_sample.json` |
+| 再構成誤差             | `images/rec_images_sigmasample/seed_{s}/b{b}/rec_error_vs_t.{png,csv,pt}`            |
+| 不確実性トラジェクトリ | `images/rec_images_sigmasample/seed_{s}/b{b}/sigma_sum_traj.pt`(σ和・σrank)         |
+| 旧σ実験の初期ブロック(復元) | `init_blocks/seed_{s}.pt`(zipに同梱)                                            |
+| まとめzip(実行終了時に自動生成) | `result_sigmasample_seed_{s}.zip` ×5 + ネスト収納した`result_sigmasample.zip`   |
+
+備考: この実験はcalibrationを新規作成しない(σモデルは旧実験と同一チェックポイントなので
+旧σ実験の`images/calibration/`成果物を流用)。σ_greedy/σ_lookaheadの曲線も旧σ実験
+(`results/STL10_1`)の成果物をそのまま使うので、zipには新variantの成果物のみ入ります。
