@@ -525,7 +525,8 @@ def lookahead_forward(ijepa, img, context_indices_list, mc_samples=1):
 
 def select_lookahead(variant, ijepa, imgs, b, device,
                      m_cands=16, all_candidates=False, init_blocks=None,
-                     mc_samples=1, sim_samples=1, sample_seed=None):
+                     mc_samples=1, sampled=False,
+                     sim_samples=1, sample_seed=None):
     """1-step lookahead uncertainty minimisation (sigma_lookahead / _center
     and mc_lookahead / mc_lookahead_center).
 
@@ -542,12 +543,16 @@ def select_lookahead(variant, ijepa, imgs, b, device,
     variants by the pooled K-sample prediction variance of the dropout-enabled
     mu predictor (mc_samples=K, so every candidate simulation runs K forwards).
 
-    sim_samples > 1 (sigma_lookahead_sample): the simulated candidate
-    features are K SAMPLES z^(k) = mu + sqrt(sigma^2) * eps of the sigma
-    head's predictive distribution (eps ~ N(0, I) in feature space, drawn
-    from the sample_seed generator), each extended context is scored by one
-    (deterministic) sigma-head forward, and the criterion is the MEAN of the
-    K unobserved-sigma sums. The prescreen stays the plain sigma map.
+    sampled=True (sigma_lookahead_sample): the simulated candidate
+    features are K = sim_samples SAMPLES z^(k) = mu + sqrt(sigma^2) * eps of
+    the sigma head's predictive distribution (eps ~ N(0, I) in feature
+    space, drawn from the sample_seed generator), each extended context is
+    scored by one (deterministic) sigma-head forward, and the criterion is
+    the MEAN of the K unobserved-sigma sums. The prescreen stays the plain
+    sigma map. K = 1 is the pure single-sample lookahead (one eps draw per
+    candidate, no averaging); K = 1 with sampled=False is NOT the same thing
+    -- an unsampled simulation uses the predictive mean (plain
+    sigma_lookahead).
 
     init_blocks: the shared per-image random initial block (used by the
     random-initial lookahead variants; identical to the other
@@ -589,7 +594,7 @@ def select_lookahead(variant, ijepa, imgs, b, device,
     sig_rank = np.full((N, max_steps), np.nan, dtype=np.float64)
     k_cand = K if all_candidates else min(m_cands, K)
     sample_gen = None
-    if sim_samples > 1:
+    if sampled:
         # seeded generator of the sampled-simulation eps stream
         # (identical seed + identical state sequence -> identical selection)
         sample_gen = torch.Generator(device=device)
@@ -678,14 +683,15 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                     cand_flat = cand.reshape(A_r * k_cand, bb)
                     cand_feats = preds[r][i_rep[:, None], cand_flat]
 
-                    if sim_samples > 1:
+                    if sampled:
                         # sampled simulation (sigma_lookahead_sample): the
                         # candidate features of EACH simulated state are
                         # samples z^(k) = mu + sqrt(var) * eps of the sigma
                         # head's predictive distribution (one deterministic
                         # sigma-head forward per sample); the criterion is
                         # the mean over the sim_samples unobserved-sigma
-                        # sums. NOTE: the prescreen above used the plain
+                        # sums (a single draw when sim_samples = 1).
+                        # NOTE: the prescreen above used the plain
                         # (mc_samples=1) sigma map — no dropout involved.
                         cand_var = sigmas[r][i_rep[:, None], cand_flat]
                         cand_std = cand_var.clamp_min(1e-12).sqrt()
@@ -1329,6 +1335,7 @@ def main():
                     init_blocks=init_blocks,
                     mc_samples=(args.mc_samples
                                 if variant in MC_LOOKAHEAD_VARIANTS else 1),
+                    sampled=(variant in SIM_LOOKAHEAD_VARIANTS),
                     sim_samples=(args.mc_samples
                                  if variant in SIM_LOOKAHEAD_VARIANTS
                                  else 1),

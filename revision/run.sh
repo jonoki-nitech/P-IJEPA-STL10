@@ -9,7 +9,7 @@
 #   sigma_lookahead, except that the simulated candidate features fed into
 #   the 1-step-ahead state are SAMPLES z^(k) = mu + sqrt(sigma^2) * eps of
 #   the sigma head's predictive distribution instead of the predictive mean.
-#   K (=K, default 16) independent eps per candidate (seeded by SAMPLE_SEED),
+#   K independent eps per candidate (K = sim_samples; seeded by SAMPLE_SEED),
 #   one deterministic sigma-head forward per sampled simulated state, and
 #   the candidate with the smallest MEAN of the unobserved-sigma sums wins.
 #   The prescreen and every other mechanism (top-M prescreen, duplicate-free
@@ -28,14 +28,15 @@
 #             selections; the comparison stays per-image paired on the
 #             initialization luck)
 #     Step 1: SEEDS (default "0 1 2 3 4") x block sizes BS (default "2 3 4";
-#             b=1 is skipped like in the old sweep's lookahead stage), one
-#             patch_selection_reconstruction_eval.py call per seed running
-#             sigma_lookahead_sample ONLY (default VARIANTS_LIST): the
-#             counterpart selection curves already exist in the OLD sweep's
-#             artefacts (sigma_greedy / sigma_lookahead, results/STL10_1) and
-#             are model outputs of the same checkpoint, so they are REUSED
-#             instead of being recomputed; compare through the overlay mode
-#             of patch_selection_reconstruction_eval.py (--points_pt <old.pt>
+#             b=1 is skipped like in the old sweep's lookahead stage) x sample
+#             counts KS (default "1 4"), one patch_selection_reconstruction_
+#             eval.py call per (K, seed) running sigma_lookahead_sample ONLY
+#             (default VARIANTS_LIST): the counterpart selection curves
+#             already exist in the OLD sweep's artefacts (sigma_greedy /
+#             sigma_lookahead, results/STL10_1) and are model outputs of the
+#             same checkpoint, so they are REUSED instead of being
+#             recomputed; compare through the overlay mode of
+#             patch_selection_reconstruction_eval.py (--points_pt <old.pt>
 #             <new.pt>; NOTE the two runs' aligned_max_t can differ because
 #             the axis is the min budget over each run's own variant set --
 #             compare only up to the common min t). The old run's per-image
@@ -52,15 +53,21 @@
 #   upfront by the checkpoint path name ("mcdropout"), since sampling from
 #   its untrained head would silently degenerate.
 #
-#   Per-seed outputs (nothing of the other seeds is touched):
-#     images/rec_images_sigmasample/seed_{s}/b{b}/
+#   Per-(K, seed) outputs (nothing of the other seeds/Ks is touched):
+#     images/rec_images_sigmasample_k{K}/seed_{s}/b{b}/
 #         rec_error_vs_t.png / .csv / .pt, sigma_sum_traj.pt
-#         (sigma_sum + sigma_rank of the three variants),
+#         (sigma_sum + sigma_rank),
 #         gallery/nXXXX.png (first --gallery_n samples)
-#     selected_patch_index/sigmasample/seed_{s}/block_{b}_tmax_32_{variant}.json
+#     selected_patch_index/sigmasample_k{K}/seed_{s}/block_{b}_tmax_32_{variant}.json
 #     init_blocks/seed_{s}.pt (shared init blocks, reproduced from the old run)
-#     result_sigmasample_seed_{s}.zip  packed at the end of the seed's run
-#     result_sigmasample.zip           bundles all seed zips (nested)
+#     result_sigmasample_k{K}_seed_{s}.zip  packed at the end of the seed's run
+#     result_sigmasample_k{K}.zip           bundles the K's seed zips (nested)
+#     result.zip                            bundles EVERY per-(K, seed) zip
+#                                           (the single file to share)
+#
+#   K = 1 (pure single-sample lookahead: one eps draw per candidate, no
+#   averaging) and K = 4 (mean of 4 sampled simulations) run SEPARATELY, so
+#   the two K readings never overwrite each other's artefacts.
 #
 #   NOTE: a (re)run OVERWRITES the artefacts of the seeds it processes and
 #   the init blocks they re-extract (existing init pts are reused unless
@@ -81,22 +88,28 @@
 #                                                #  dirs (default
 #                                                #  selected_patch_index,
 #                                                #  one seed_{s} dir each)
-#     K=8 ...                                    # predictive-distribution
+#     KS="1 4" ...                               # predictive-distribution
 #                                                #  samples of
-#                                                #  sigma_lookahead_sample
-#                                                #  (default 16, passed as
-#                                                #  --mc-samples)
+#                                                #  sigma_lookahead_sample to
+#                                                #  run (default "1 4"; each K
+#                                                #  is its own pse run with
+#                                                #  --mc-samples K; K=1 means
+#                                                #  a single eps draw per
+#                                                #  candidate -- NOT the
+#                                                #  predictive mean)
 #     SAMPLE_SEED=0 ...                          # torch seed of the eps
-#                                                #  stream (default 0;
+#                                                #  streams (default 0;
 #                                                #  =--mc-seed; identical
 #                                                #  runs repeat exactly)
 #     LOOKAHEAD_M=8 ...                          # lookahead candidate prescreen
 #                                                #  (default 16 = the old sweep;
 #                                                #  ALL_CANDIDATES=1 disables
 #                                                #  the prescreen)
-#     VARIANTS_LIST="..." ...                    # (default: sigma_greedy
-#                                                #  sigma_lookahead
-#                                                #  sigma_lookahead_sample)
+#     VARIANTS_LIST="..." ...                    # (default:
+#                                                #  sigma_lookahead_sample;
+#                                                #  sigma_greedy /
+#                                                #  sigma_lookahead come from
+#                                                #  the OLD sweep's artefacts)
 #     RUN_CALIB=1 ...                            # redo the plain sigma
 #                                                #  calibration (b=4, "4:4")
 #     FORCE_INIT=1 ...                           # re-extract the init blocks
@@ -107,13 +120,12 @@
 #                                                #  instead, which breaks the
 #                                                #  pairing with the old run)
 #     SKIP_ZIP=1 ...                             # skip packaging
-#     ZIP_PREFIX=result_sigmasample ...          # zip base name
+#     ZIP_PREFIX=result_sigmasample_k{K} ...     # zip base name per K
 #
-#   Runtime at N=8000, K=16 (24 GB GPU): sigma_greedy ~10-20 min,
-#   sigma_lookahead ~30-50 min (the old sweep's numbers), the sampled
-#   variant ~K x that (candidate simulations = K x the old count), and the
-#   MAE ~1.5-2 h per seed -> expect roughly a day UNLESS the sampled variant
-#   ends up even slower; measure with N=100 before the 5-seed full run.
+#   Runtime at N=8000 (24 GB GPU) per seed: K=1's selection is the old
+#   sigma_lookahead cost (~30-50 min), K=4's is ~4x that (~2-3 h), each run
+#   adds an MAE sweep (~1.5-2 h) -> the two-K default is roughly 5-7 h per
+#   seed (~1-1.5 days for the 5 seeds); measure with N=100 first.
 #
 #   Requires: torch, torchvision, numpy, matplotlib, einops, tqdm.
 #   STL10 data is resolved by data_utils.py: if the server data directory
@@ -135,8 +147,8 @@ GALLERY_N=${GALLERY_N:-10}
 LOOKAHEAD_M=${M:-16}      # lookahead candidate prescreen size
 LOOKAHEAD_BS=${LOOKAHEAD_BS:-"2 3 4"} # block sizes that run the lookahead
 VARIANTS_LIST=${VARIANTS_LIST:-"sigma_lookahead_sample"}
-K=${K:-16}                # predictive-distribution samples of the new variant
-SAMPLE_SEED=${SAMPLE_SEED:-0} # torch seed of its eps stream (-> --mc-seed)
+K=${KS:-"1 4"}            # sample-count runs of the new variant (1 = single draw)
+SAMPLE_SEED=${SAMPLE_SEED:-0} # torch seed of the eps streams (-> --mc-seed)
 MODEL_PATH=${MODEL_PATH:-models/embdim=512_epoch=300_patchsize=8/training_model.pth}
 MAE_MODEL_PATH=${MAE_MODEL_PATH:-models/mae/latest.ckpt}
 export CHUNK=${CHUNK:-1024} # chunk size of the batched forward passes
@@ -144,6 +156,8 @@ export CHUNK=${CHUNK:-1024} # chunk size of the batched forward passes
 OUT_TAG="sigmasample"
 INIT_DIR="init_blocks"
 OLD_JSON_BASE=${OLD_JSON_BASE:-selected_patch_index} # old sweep's per-seed JSON dirs
+ALL_SEED_ZIPS=""          # names of every per-(K, seed) zip created by Step 1,
+                          # collected for the final single result.zip bundle
 
 LOOKAHEAD_FLAGS=""
 if [ "${ALL_CANDIDATES:-0}" = "1" ]; then
@@ -151,7 +165,7 @@ if [ "${ALL_CANDIDATES:-0}" = "1" ]; then
 fi
 
 echo "python : $($PY --version 2>&1)"
-echo "params : N=$N   bs=$BS   seeds=[$SEEDS]   device=$DEVICE   gallery_n=$GALLERY_N   K=$K   sample_seed=$SAMPLE_SEED   M=$LOOKAHEAD_M   lookahead_bs=[$LOOKAHEAD_BS]   old_json_base=$OLD_JSON_BASE   model=$MODEL_PATH"
+echo "params : N=$N   bs=$BS   seeds=[$SEEDS]   device=$DEVICE   gallery_n=$GALLERY_N   KS=[$K]   sample_seed=$SAMPLE_SEED   M=$LOOKAHEAD_M   lookahead_bs=[$LOOKAHEAD_BS]   old_json_base=$OLD_JSON_BASE   model=$MODEL_PATH"
 
 # per-seed sanity check of the old-JSON locations before any heavy step
 if [ "${SKIP_INIT:-0}" != "1" ]; then
@@ -212,20 +226,23 @@ if [ "${SKIP_INIT:-0}" != "1" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Step 1: per-seed selection (=the three sigma_* variants share-aligned) +
-#         MAE sweep + per-seed zip
+# Step 1: per-K sample count of sigma_lookahead_sample (each K is a SEPARATE
+#         pse run: K = 1 = single-sample lookahead, K > 1 = mean over K
+#         sampled simulations) + MAE sweep + per-(K, seed) zip
 # -----------------------------------------------------------------------------
+for K in $KS; do
 for SEED in $SEEDS; do
     SEED_DIR="seed_${SEED}"
-    REC_DIR="images/rec_images_${OUT_TAG}/${SEED_DIR}"
-    JSON_DIR="selected_patch_index/${OUT_TAG}/${SEED_DIR}"
+    TAG_K="${OUT_TAG}_k${K}"
+    REC_DIR="images/rec_images_${TAG_K}/${SEED_DIR}"
+    JSON_DIR="selected_patch_index/${TAG_K}/${SEED_DIR}"
     INIT_ARGS=""
     if [ "${SKIP_INIT:-0}" != "1" ]; then
         INIT_ARGS="--init-blocks-pt ${INIT_DIR}/seed_${SEED}.pt"
     fi
 
     echo ""
-    echo "=== Step 1: seed=$SEED (selection + MAE reconstruction vs t) ======"
+    echo "=== Step 1: K=$K seed=$SEED (selection + MAE reconstruction vs t) ==="
     $PY patch_selection_reconstruction_eval.py \
         --model_path "$MODEL_PATH" \
         --mae_model_path "$MAE_MODEL_PATH" \
@@ -245,14 +262,14 @@ for SEED in $SEEDS; do
         --device "$DEVICE"
 
     # -------------------------------------------------------------------------
-    # Package this seed's artefacts (+ the seed's init blocks) into one zip
+    # Package this (K, seed)'s artefacts (+ the seed's init blocks) into a zip
     # -------------------------------------------------------------------------
     if [ "${SKIP_ZIP:-0}" != "1" ]; then
-        ZIP="${ZIP_PREFIX:-result_sigmasample}_${SEED_DIR}.zip"
+        ZIP="${ZIP_PREFIX:-result_sigmasample_k${K}}_${SEED_DIR}.zip"
         echo ""
         echo "=== Pack artefacts into $ZIP ===================================="
         rm -f "$ZIP"
-        "$PY" - "$ZIP" "$SEED_DIR" "$OUT_TAG" "$INIT_DIR" <<'PYEOF'
+        "$PY" - "$ZIP" "$SEED_DIR" "$TAG_K" "$INIT_DIR" <<'PYEOF'
 import os, sys, zipfile
 zip_name, seed_dir, out_tag, init_dir = sys.argv[1:5]
 roots = [f"images/rec_images_{out_tag}/{seed_dir}",
@@ -267,22 +284,49 @@ with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.write(os.path.join(dirpath, f))
 print(f"created: {zip_name} ({os.path.getsize(zip_name) / 1e6:.1f} MB)")
 PYEOF
+        ALL_SEED_ZIPS="$ALL_SEED_ZIPS $ZIP"
     fi
+done
 done
 
 # -----------------------------------------------------------------------------
-# Bundle all per-seed zips into one result zip (nested: the seed zips are
-# stored as-is, without re-compression)
+# Bundle all per-(K, seed) zips into one result zip per K (nested: the seed
+# zips are stored as-is, without re-compression)
 # -----------------------------------------------------------------------------
 if [ "${SKIP_ZIP:-0}" != "1" ]; then
-    RESULT_ZIP="${ZIP_PREFIX:-result_sigmasample}.zip"
-    echo ""
-    echo "=== Bundle per-seed zips into $RESULT_ZIP ======================="
-    rm -f "$RESULT_ZIP"
-    "$PY" - "$RESULT_ZIP" "${ZIP_PREFIX:-result_sigmasample}_seed_" "$SEEDS" <<'PYEOF'
+    for K in $KS; do
+        K_PREFIX="${ZIP_PREFIX:-result_sigmasample_k${K}}"
+        RESULT_ZIP="${K_PREFIX}.zip"
+        echo ""
+        echo "=== Bundle per-seed zips into $RESULT_ZIP ======================="
+        rm -f "$RESULT_ZIP"
+        "$PY" - "$RESULT_ZIP" "${K_PREFIX}_seed_" "$SEEDS" <<'PYEOF'
 import os, sys, zipfile
 result_zip, prefix, seeds = sys.argv[1], sys.argv[2], sys.argv[3]
 seed_zips = [f"{prefix}{s}.zip" for s in seeds.split()]
+with zipfile.ZipFile(result_zip, "w", zipfile.ZIP_STORED) as zf:
+    for n in seed_zips:
+        zf.write(n, os.path.basename(n))
+print(f"created: {result_zip} ({os.path.getsize(result_zip) / 1e6:.1f} MB, "
+      f"{len(seed_zips)} seed zips)")
+PYEOF
+    done
+fi
+
+# -----------------------------------------------------------------------------
+# Final bundle: EVERY per-(K, seed) zip collected in Step 1 into ONE result.zip
+# (the single file to share; the seed zips inside are stored as-is, without
+# re-compression, like the old sweep's result.zip)
+# -----------------------------------------------------------------------------
+if [ "${SKIP_ZIP:-0}" != "1" ] && [ -n "$ALL_SEED_ZIPS" ]; then
+    echo ""
+    echo "=== Bundle EVERYTHING into result.zip ==========================="
+    rm -f result.zip
+    # shellcheck disable=SC2086
+    "$PY" - result.zip $ALL_SEED_ZIPS <<'PYEOF'
+import os, sys, zipfile
+result_zip = sys.argv[1]
+seed_zips = sys.argv[2:]
 with zipfile.ZipFile(result_zip, "w", zipfile.ZIP_STORED) as zf:
     for n in seed_zips:
         zf.write(n, os.path.basename(n))
