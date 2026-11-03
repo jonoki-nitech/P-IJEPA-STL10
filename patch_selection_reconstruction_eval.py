@@ -32,6 +32,22 @@
 #                     whose simulated sigma map leaves the smallest total
 #                     sigma over the remaining unobserved patches is chosen
 #                     (--M prescreen, --all-candidates disables it)
+#   sigma_lookahead_sample
+#                     same as sigma_lookahead, but the simulated candidate
+#                     features are SAMPLES z^(k) = mu + sqrt(sigma^2) * eps
+#                     of the sigma head's predictive distribution instead of
+#                     the predictive mean: every top-M candidate is simulated
+#                     sim_samples (=--mc-samples, default 16) times with
+#                     independent eps (seeded by --mc-seed), each simulated
+#                     state is scored by one (deterministic) sigma-head
+#                     forward, and the candidate with the smallest MEAN of
+#                     the unobserved-sigma sums is chosen (paper role: does
+#                     simulating the counterfactual state with predictive
+#                     SAMPLES instead of the predictive MEAN improve the
+#                     1-step lookahead?). Requires the sigma-head I-JEPA
+#                     checkpoint (an MC-Dropout checkpoint's sigma head is
+#                     untrained and is rejected upfront). Center-init not
+#                     offered (no counterpart in the old sweep).
 #   sigma_lookahead_center
 #                     same as sigma_lookahead but the initial block is the
 #                     center block
@@ -64,7 +80,9 @@
 #
 # The lookahead simulation runs an extra predictor pass per candidate
 # (batched in (images x candidates) chunks of CHUNK_SIZE rows); the mc_*
-# lookahead variants run K such passes (mc dropout) per candidate.
+# lookahead variants run K such passes (mc dropout) per candidate, and
+# sigma_lookahead_sample runs sim_samples (=--mc-samples) deterministic
+# sigma-head passes (one per sampled simulated state) per candidate.
 #
 # Uncertainty recording: while selecting, the sigma-based variants record,
 # per image and state (t blocks observed), the sum of sigma over the patches
@@ -170,6 +188,7 @@ VARIANTS = [
     "ame",
     "sigma_lookahead",
     "sigma_lookahead_center",
+    "sigma_lookahead_sample",
     "mc_greedy",
     "mc_center",
     "mc_lookahead",
@@ -178,8 +197,14 @@ VARIANTS = [
 SIGMA_VARIANTS = ["sigma_greedy", "sigma_center"]
 MC_VARIANTS = ["mc_greedy", "mc_center"]
 LOOKAHEAD_VARIANTS = ["sigma_lookahead", "sigma_lookahead_center",
+                      "sigma_lookahead_sample",
                       "mc_lookahead", "mc_lookahead_center"]
 MC_LOOKAHEAD_VARIANTS = ["mc_lookahead", "mc_lookahead_center"]
+# sampled simulation: instead of the predictive mean, the candidate features
+# of each simulated 1-step-ahead state are SAMPLES z ~ N(mu, sigma^2) of the
+# sigma head's predictive distribution (K sims per candidate, criterion =
+# mean of the K unobserved-sigma sums); sigma-head model required
+SIM_LOOKAHEAD_VARIANTS = ["sigma_lookahead_sample"]
 OUT_DIR = "images/rec_images_tmax32"
 
 ALL_PATCHES = list(range(144))
@@ -500,7 +525,7 @@ def lookahead_forward(ijepa, img, context_indices_list, mc_samples=1):
 
 def select_lookahead(variant, ijepa, imgs, b, device,
                      m_cands=16, all_candidates=False, init_blocks=None,
-                     mc_samples=1):
+                     mc_samples=1, sim_samples=1, sample_seed=None):
     """1-step lookahead uncertainty minimisation (sigma_lookahead / _center
     and mc_lookahead / mc_lookahead_center).
 
@@ -516,6 +541,13 @@ def select_lookahead(variant, ijepa, imgs, b, device,
     The sigma_* variants score by the sigma head (mc_samples=1); the mc_*
     variants by the pooled K-sample prediction variance of the dropout-enabled
     mu predictor (mc_samples=K, so every candidate simulation runs K forwards).
+
+    sim_samples > 1 (sigma_lookahead_sample): the simulated candidate
+    features are K SAMPLES z^(k) = mu + sqrt(sigma^2) * eps of the sigma
+    head's predictive distribution (eps ~ N(0, I) in feature space, drawn
+    from the sample_seed generator), each extended context is scored by one
+    (deterministic) sigma-head forward, and the criterion is the MEAN of the
+    K unobserved-sigma sums. The prescreen stays the plain sigma map.
 
     init_blocks: the shared per-image random initial block (used by the
     random-initial lookahead variants; identical to the other
@@ -556,6 +588,13 @@ def select_lookahead(variant, ijepa, imgs, b, device,
     sig_sum = np.full((N, max_steps), np.nan, dtype=np.float64)
     sig_rank = np.full((N, max_steps), np.nan, dtype=np.float64)
     k_cand = K if all_candidates else min(m_cands, K)
+    sample_gen = None
+    if sim_samples > 1:
+        # seeded generator of the sampled-simulation eps stream
+        # (identical seed + identical state sequence -> identical selection)
+        sample_gen = torch.Generator(device=device)
+        sample_gen.manual_seed(
+            sample_seed if sample_seed is not None else 0)
     step = 1
 
     while active and step < max_steps:
@@ -639,31 +678,73 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                     cand_flat = cand.reshape(A_r * k_cand, bb)
                     cand_feats = preds[r][i_rep[:, None], cand_flat]
 
-                    sim_parts = [
-                        ctx_feats[r].repeat_interleave(k_cand, dim=0),
-                        cand_feats + pos_emb[cand_flat],
-                    ]
-                    if R > 0:
-                        # remaining (still-unobserved) mask tokens; at the
-                        # final state (t = max_steps - 1, e.g. b=1 at t=143)
-                        # R = 0 and the context + candidate alone already
-                        # make up all 144 tokens
-                        sim_parts.append(
-                            (ijepa.mask_token.view(1, 1, 1, -1)
-                             + pos_emb[rem_pos]).reshape(A_r * k_cand, R, -1))
-                    sim_in = torch.cat(sim_parts, dim=1)     # (A_r*k,144,D)
-                    with torch.no_grad():
-                        if mc_samples > 1:
-                            _, sim_pool = mc_predict(
-                                ijepa, sim_in, len(ALL_PATCHES), mc_samples)
-                            sig_sim = sim_pool.squeeze(-1)   # (A_r*k,144)
-                        else:
-                            sigma_out = ijepa.sigma_predictor(
-                                sim_in, patchify=False, pos_embed=False)
-                            sig_sim = ijepa.sigma_predictor_head(sigma_out)
-                            sig_sim = sig_sim.squeeze(-1)
+                    if sim_samples > 1:
+                        # sampled simulation (sigma_lookahead_sample): the
+                        # candidate features of EACH simulated state are
+                        # samples z^(k) = mu + sqrt(var) * eps of the sigma
+                        # head's predictive distribution (one deterministic
+                        # sigma-head forward per sample); the criterion is
+                        # the mean over the sim_samples unobserved-sigma
+                        # sums. NOTE: the prescreen above used the plain
+                        # (mc_samples=1) sigma map — no dropout involved.
+                        cand_var = sigmas[r][i_rep[:, None], cand_flat]
+                        cand_std = cand_var.clamp_min(1e-12).sqrt()
+                        obj = torch.zeros(A_r, k_cand, device=device)
+                        for _ in range(sim_samples):
+                            eps = torch.randn(cand_feats.shape,
+                                              generator=sample_gen,
+                                              device=device)
+                            sim_parts_s = [
+                                ctx_feats[r].repeat_interleave(
+                                    k_cand, dim=0),
+                                (cand_feats + cand_std[..., None] * eps
+                                 + pos_emb[cand_flat]),
+                            ]
+                            if R > 0:
+                                sim_parts_s.append(
+                                    (ijepa.mask_token.view(1, 1, 1, -1)
+                                     + pos_emb[rem_pos]).reshape(
+                                        A_r * k_cand, R, -1))
+                            sim_in = torch.cat(sim_parts_s, dim=1)
+                            with torch.no_grad():
+                                sigma_out = ijepa.sigma_predictor(
+                                    sim_in, patchify=False,
+                                    pos_embed=False)
+                                sig_sim = ijepa.sigma_predictor_head(
+                                    sigma_out)
+                                sig_sim = sig_sim.squeeze(-1)
+                            obj = obj + sig_sim.sum(
+                                dim=1).reshape(A_r, k_cand)
+                        obj = obj / sim_samples
+                    else:
+                        sim_parts = [
+                            ctx_feats[r].repeat_interleave(k_cand, dim=0),
+                            cand_feats + pos_emb[cand_flat],
+                        ]
+                        if R > 0:
+                            # remaining (still-unobserved) mask tokens; at
+                            # the final state (t = max_steps - 1, e.g. b=1
+                            # at t=143) R = 0 and the context + candidate
+                            # alone already make up all 144 tokens
+                            sim_parts.append(
+                                (ijepa.mask_token.view(1, 1, 1, -1)
+                                 + pos_emb[rem_pos]).reshape(
+                                    A_r * k_cand, R, -1))
+                        sim_in = torch.cat(sim_parts, dim=1)  # (A_r*k,144,D)
+                        with torch.no_grad():
+                            if mc_samples > 1:
+                                _, sim_pool = mc_predict(
+                                    ijepa, sim_in, len(ALL_PATCHES),
+                                    mc_samples)
+                                sig_sim = sim_pool.squeeze(-1)  # (A_r*k,144)
+                            else:
+                                sigma_out = ijepa.sigma_predictor(
+                                    sim_in, patchify=False, pos_embed=False)
+                                sig_sim = ijepa.sigma_predictor_head(
+                                    sigma_out)
+                                sig_sim = sig_sim.squeeze(-1)
 
-                    obj = sig_sim.sum(dim=1).reshape(A_r, k_cand)
+                        obj = sig_sim.sum(dim=1).reshape(A_r, k_cand)
                     best_r[s0:s1] = obj.argmin(dim=1)
                 best_anchor[rows] = sel_idx[rows, best_r]
                 # record: the chosen block was the (best_r+1)-th largest
@@ -934,8 +1015,9 @@ def main():
                              'Names: sigma_greedy sigma_center random_greedy '
                              'random_center center_outward raster '
                              'raster_center ame sigma_lookahead '
-                             'sigma_lookahead_center mc_greedy mc_center '
-                             'mc_lookahead mc_lookahead_center')
+                             'sigma_lookahead_center sigma_lookahead_sample '
+                             'mc_greedy mc_center mc_lookahead '
+                             'mc_lookahead_center')
     parser.add_argument('--lookahead-bs', type=int, nargs='+',
                         default=[1, 2, 3, 4], metavar='B',
                         help='block sizes for the lookahead variants '
@@ -947,12 +1029,17 @@ def main():
                              '(default: 1..aligned max t)')
     parser.add_argument('--mc-samples', type=int, default=16,
                         help='number of dropout-enabled mu-predictor forwards '
-                             'used by the mc_* variants (default: 16; the '
-                             'sigma_* variants always use the sigma head)')
+                             'used by the mc_* variants, and the number of '
+                             'predictive-distribution samples of the '
+                             'sigma_lookahead_sample simulations (default: '
+                             '16; plain sigma_* variants always use the '
+                             'sigma head once)')
     parser.add_argument('--mc-seed', type=int, default=0,
-                        help='torch seed for the mc_* dropout samples '
-                             '(seeded once, after the model loads, so the '
-                             'K-sample stream is reproducible)')
+                        help='torch seed for the mc_* dropout samples and '
+                             'the sigma_lookahead_sample eps stream '
+                             '(seeded once, after the model loads, so a '
+                             'repeat run with the same seed reproduces the '
+                             'same selections)')
     parser.add_argument('--log', action='store_true',
                         help='use a log scale on the y axis')
     parser.add_argument('--gallery_n', type=int, default=10,
@@ -1157,6 +1244,19 @@ def main():
             f"--mc-samples {args.mc_samples} requires dropout inside "
             f"ijepa.mu_predictor (an MC-Dropout checkpoint); "
             f"{args.model_path} has none")
+    if any(v in SIM_LOOKAHEAD_VARIANTS for v in run_variants) \
+            and "mcdropout" in os.path.normpath(args.model_path).lower():
+        # sampled simulation draws from the sigma head's predictive
+        # distribution; the MC-Dropout baseline checkpoint's sigma head is
+        # UNTRAINED (the two families are kept in separate default paths:
+        # models/mcdropout_... vs models/embdim=512_epoch=300_...), so the
+        # path name discriminates them unambiguously
+        raise SystemExit(
+            f"sigma_lookahead_sample requires the sigma-head I-JEPA "
+            f"checkpoint (models/embdim=512_epoch=300_patchsize=8/...); "
+            f"{args.model_path} is the MC-Dropout checkpoint whose sigma "
+            f"head is untrained -- sampling from it would silently "
+            f"degenerate into the plain sigma_lookahead simulation")
     print(f'variants: {run_variants}')
     print(f'lookahead block sizes: {args.lookahead_bs}')
 
@@ -1228,7 +1328,13 @@ def main():
                     m_cands=args.M, all_candidates=args.all_candidates,
                     init_blocks=init_blocks,
                     mc_samples=(args.mc_samples
-                                if variant in MC_LOOKAHEAD_VARIANTS else 1))
+                                if variant in MC_LOOKAHEAD_VARIANTS else 1),
+                    sim_samples=(args.mc_samples
+                                 if variant in SIM_LOOKAHEAD_VARIANTS
+                                 else 1),
+                    sample_seed=(args.mc_seed
+                                 if variant in SIM_LOOKAHEAD_VARIANTS
+                                 else None))
             elif variant in ("random_greedy", "random_center"):
                 seqs[variant], stops[variant] = select_random(
                     variant, b, rng, n, init_blocks)
