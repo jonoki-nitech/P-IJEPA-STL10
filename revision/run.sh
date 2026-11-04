@@ -147,7 +147,7 @@ GALLERY_N=${GALLERY_N:-10}
 LOOKAHEAD_M=${M:-16}      # lookahead candidate prescreen size
 LOOKAHEAD_BS=${LOOKAHEAD_BS:-"2 3 4"} # block sizes that run the lookahead
 VARIANTS_LIST=${VARIANTS_LIST:-"sigma_lookahead_sample"}
-K=${KS:-"1 4"}            # sample-count runs of the new variant (1 = single draw)
+KS=${KS:-"1 4"}           # sample-count runs of the new variant (1 = single draw)
 SAMPLE_SEED=${SAMPLE_SEED:-0} # torch seed of the eps streams (-> --mc-seed)
 MODEL_PATH=${MODEL_PATH:-models/embdim=512_epoch=300_patchsize=8/training_model.pth}
 MAE_MODEL_PATH=${MAE_MODEL_PATH:-models/mae/latest.ckpt}
@@ -165,7 +165,7 @@ if [ "${ALL_CANDIDATES:-0}" = "1" ]; then
 fi
 
 echo "python : $($PY --version 2>&1)"
-echo "params : N=$N   bs=$BS   seeds=[$SEEDS]   device=$DEVICE   gallery_n=$GALLERY_N   KS=[$K]   sample_seed=$SAMPLE_SEED   M=$LOOKAHEAD_M   lookahead_bs=[$LOOKAHEAD_BS]   old_json_base=$OLD_JSON_BASE   model=$MODEL_PATH"
+echo "params : N=$N   bs=$BS   seeds=[$SEEDS]   device=$DEVICE   gallery_n=$GALLERY_N   KS=[$KS]   sample_seed=$SAMPLE_SEED   M=$LOOKAHEAD_M   lookahead_bs=[$LOOKAHEAD_BS]   old_json_base=$OLD_JSON_BASE   model=$MODEL_PATH"
 
 # per-seed sanity check of the old-JSON locations before any heavy step
 if [ "${SKIP_INIT:-0}" != "1" ]; then
