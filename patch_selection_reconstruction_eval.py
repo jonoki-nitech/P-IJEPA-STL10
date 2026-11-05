@@ -48,6 +48,20 @@
 #                     checkpoint (an MC-Dropout checkpoint's sigma head is
 #                     untrained and is rejected upfront). Center-init not
 #                     offered (no counterpart in the old sweep).
+#   sigma_lookahead_sample_ms
+#                     multi-step version of sigma_lookahead_sample: each of
+#                     the K rollouts of a candidate simulates up to
+#                     --lookahead-steps (default 2) SEQUENTIAL additions --
+#                     addition 1 is the candidate, then the fully-unobserved
+#                     anchor with the largest pooled sigma of the current
+#                     simulated state is chosen (greedy) and its feature
+#                     z ~ N(mu, sigma^2) is SAMPLED from that state's own
+#                     predictive distribution and appended (every addition is
+#                     sampled, everywhere inside the rollout); the rollout
+#                     score is the sigma sum of the final simulated state
+#                     (mean over the K rollouts), freezing when no
+#                     fully-unobserved anchor remains. Requires the sigma-
+#                     head I-JEPA checkpoint like sigma_lookahead_sample.
 #   sigma_lookahead_center
 #                     same as sigma_lookahead but the initial block is the
 #                     center block
@@ -189,6 +203,8 @@ VARIANTS = [
     "sigma_lookahead",
     "sigma_lookahead_center",
     "sigma_lookahead_sample",
+    "sigma_lookahead_sample_ms",
+    "sigma_lookahead_sample_msn",
     "mc_greedy",
     "mc_center",
     "mc_lookahead",
@@ -197,14 +213,33 @@ VARIANTS = [
 SIGMA_VARIANTS = ["sigma_greedy", "sigma_center"]
 MC_VARIANTS = ["mc_greedy", "mc_center"]
 LOOKAHEAD_VARIANTS = ["sigma_lookahead", "sigma_lookahead_center",
-                      "sigma_lookahead_sample",
+                      "sigma_lookahead_sample", "sigma_lookahead_sample_ms",
+                      "sigma_lookahead_sample_msn",
                       "mc_lookahead", "mc_lookahead_center"]
 MC_LOOKAHEAD_VARIANTS = ["mc_lookahead", "mc_lookahead_center"]
 # sampled simulation: instead of the predictive mean, the candidate features
 # of each simulated 1-step-ahead state are SAMPLES z ~ N(mu, sigma^2) of the
 # sigma head's predictive distribution (K sims per candidate, criterion =
-# mean of the K unobserved-sigma sums); sigma-head model required
-SIM_LOOKAHEAD_VARIANTS = ["sigma_lookahead_sample"]
+# mean of the K unobserved-sigma sums); sigma-head model required.
+# sigma_lookahead_sample_ms extends the same idea to a multi-step SEQUENTIAL
+# rollout: every simulated addition samples from the predictive distribution
+# of the simulated state so far, the next added anchor is the largest-pooled-
+# sigma fully-unobserved anchor of that state (greedy), and the score is the
+# sigma sum of the final simulated state averaged over the K rollouts
+# (--lookahead-steps = rollout length). sigma-head model required.
+# sigma_lookahead_sample_msn is the NESTED version: the follow-up anchor of
+# each rollout is chosen the same way the 1-step candidate was (every one of
+# the top-M fully-unobserved anchors of the simulated state is itself
+# simulated with a sampled addition, and the anchor whose resulting state
+# leaves the smallest sigma sum wins); the rollout score is the best (min)
+# sigma sum over the follow-up options, mean over K rollouts. Depth 2
+# (candidate + one nested level), cost ~ M*(M+2) forwards per real step.
+SIM_LOOKAHEAD_VARIANTS = ["sigma_lookahead_sample", "sigma_lookahead_sample_ms",
+                          "sigma_lookahead_sample_msn"]
+# nested variant: the follow-up anchor inside the rollout is chosen like the
+# 1-step candidate itself (each top-M option of the simulated state is
+# simulated with a sampled addition, and the min-sigma-sum one wins)
+SIM_NESTED_LOOKAHEAD_VARIANTS = ["sigma_lookahead_sample_msn"]
 OUT_DIR = "images/rec_images_tmax32"
 
 ALL_PATCHES = list(range(144))
@@ -526,7 +561,7 @@ def lookahead_forward(ijepa, img, context_indices_list, mc_samples=1):
 def select_lookahead(variant, ijepa, imgs, b, device,
                      m_cands=16, all_candidates=False, init_blocks=None,
                      mc_samples=1, sampled=False,
-                     sim_samples=1, sample_seed=None):
+                     sim_samples=1, sample_seed=None, sim_steps=1):
     """1-step lookahead uncertainty minimisation (sigma_lookahead / _center
     and mc_lookahead / mc_lookahead_center).
 
@@ -553,6 +588,19 @@ def select_lookahead(variant, ijepa, imgs, b, device,
     candidate, no averaging); K = 1 with sampled=False is NOT the same thing
     -- an unsampled simulation uses the predictive mean (plain
     sigma_lookahead).
+
+    sampled=True AND sim_steps > 1 (sigma_lookahead_sample_ms): each of the
+    K rollouts of a candidate is a multi-step SEQUENTIAL SIMULATION --
+    addition 1 is the candidate itself (one eps draw), then for
+    l = 2..sim_steps the fully-unobserved anchor with the LARGEST pooled
+    sigma of the current simulated state is chosen (greedy) and its feature
+    z_l ~ N(mu_l, sigma_l^2) is SAMPLED from that state's own predictive
+    distribution and appended; the score of a rollout is the sigma sum of
+    its FINAL simulated state (after sim_steps additions) and the criterion
+    is the mean over the K rollouts. A rollout freezes (its last state
+    score is kept) as soon as no fully-unobserved anchor remains. Cost:
+    (2*sim_steps - 1) predictor forwards per (candidate x rollout) -- the
+    mu map of the intermediate states is needed for the next eps draw.
 
     init_blocks: the shared per-image random initial block (used by the
     random-initial lookahead variants; identical to the other
@@ -660,6 +708,12 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                 best_r = torch.full((rows.numel(),), -1, dtype=torch.long,
                                     device=device)
                 sub = max(1, CHUNK_SIZE // k_cand)
+                if sampled and (variant in SIM_NESTED_LOOKAHEAD_VARIANTS
+                                or sim_steps > 1):
+                    # the rollout rows2 = rows * sim_samples (and the
+                    # nested scoring adds an options axis below): keep the
+                    # per-forward row count within CHUNK for every arm
+                    sub = max(1, CHUNK_SIZE // (k_cand * sim_samples))
                 for s0, s1 in iter_chunks(rows.numel(), chunk_size=sub):
                     r = rows[s0:s1]
                     A_r = r.numel()
@@ -683,46 +737,262 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                     cand_flat = cand.reshape(A_r * k_cand, bb)
                     cand_feats = preds[r][i_rep[:, None], cand_flat]
 
-                    if sampled:
-                        # sampled simulation (sigma_lookahead_sample): the
-                        # candidate features of EACH simulated state are
-                        # samples z^(k) = mu + sqrt(var) * eps of the sigma
-                        # head's predictive distribution (one deterministic
-                        # sigma-head forward per sample); the criterion is
-                        # the mean over the sim_samples unobserved-sigma
-                        # sums (a single draw when sim_samples = 1).
-                        # NOTE: the prescreen above used the plain
-                        # (mc_samples=1) sigma map — no dropout involved.
-                        cand_var = sigmas[r][i_rep[:, None], cand_flat]
-                        cand_std = cand_var.clamp_min(1e-12).sqrt()
-                        obj = torch.zeros(A_r, k_cand, device=device)
-                        for _ in range(sim_samples):
-                            eps = torch.randn(cand_feats.shape,
-                                              generator=sample_gen,
-                                              device=device)
-                            sim_parts_s = [
-                                ctx_feats[r].repeat_interleave(
-                                    k_cand, dim=0),
-                                (cand_feats + cand_std[..., None] * eps
-                                 + pos_emb[cand_flat]),
-                            ]
+                    if sampled and (variant in SIM_NESTED_LOOKAHEAD_VARIANTS
+                                    or sim_steps > 1):
+                        # multi-step sampled rollout (sigma_lookahead_sample_
+                        # ms): prescreen = plain sigma map (above); each of
+                        # the sim_samples rollouts of a candidate is a
+                        # sequential simulation of up to sim_steps additions
+                        # where EVERY added feature is a sample z ~ N(mu,
+                        # sigma^2) of the state it is added to, the next added
+                        # anchor is the fully-unobserved anchor with the
+                        # LARGEST pooled sigma of the current simulated state
+                        # (greedy), and the rollout score is the sigma sum of
+                        # its FINAL simulated state; the criterion is the
+                        # mean over the K rollouts. A rollout freezes (keeps
+                        # the sigma sum of its last reachable state) as soon
+                        # as no fully-unobserved anchor remains, so the
+                        # horizon is implicitly capped by the remaining fresh
+                        # patches (L_eff = 1 + R // bb <= sim_steps). Forward
+                        # count: L sigma-heads + (L-1) mu-heads per (candidate
+                        # x rollout) row -- the mu map of the intermediate
+                        # states is needed for the next eps draw.
+                        rows2 = A_r * k_cand * sim_samples
+                        row_patch_ar = torch.arange(rows2, device=device)[:, None]
+                        row_img = torch.arange(A_r, device=device) \
+                            .repeat_interleave(k_cand * sim_samples)
+                        cand_ms = (cand.reshape(A_r * k_cand, 1, bb)
+                                   .expand(A_r * k_cand, sim_samples, bb)
+                                   .reshape(rows2, bb))
+                        ctx_rep = ctx_feats[r].repeat_interleave(
+                            k_cand * sim_samples, dim=0)
+                        base_obs = ctx_bool[r].repeat_interleave(
+                            k_cand * sim_samples, dim=0)
+                        anchor_dev = anchor_bool.to(device)
+                        # rollout state 0 = the prescreen state (its maps are
+                        # already computed): add 1 = the candidate itself
+                        mu0 = preds[r][row_img[:, None], cand_ms]
+                        sig0 = sigmas[r][row_img[:, None], cand_ms]
+                        z_list = [mu0 + sig0.clamp_min(1e-12).sqrt()
+                                  [..., None]
+                                  * torch.randn(mu0.shape,
+                                                generator=sample_gen,
+                                                device=device)]
+                        patches_list = [cand_ms]
+                        if variant in SIM_NESTED_LOOKAHEAD_VARIANTS:
+                            # ---- NESTED rollout (sigma_lookahead_sample_
+                            # msn): depth-2 planning. State 1 = state0 + the
+                            # candidate's sampled addition (z1 above); its
+                            # (mu1, sigma1) maps define the follow-up options:
+                            # every one of the top-m_cands fully-unobserved
+                            # anchors of state1 (by pooled sigma) is itself
+                            # simulated with a sampled addition z2 ~ N(mu1,
+                            # sigma1^2), the resulting sigma sums are reduced
+                            # with amin per rollout row, and score(c1) is the
+                            # MIN over the follow-up options (mean over the K
+                            # rollouts). Rows whose state1 offers no
+                            # fully-unobserved anchor freeze at
+                            # sigma_sum(state1). Cost ~ m_cands forward pairs
+                            # per (candidate x rollout) beyond state 1.
+                            ar_dev = torch.arange(len(ALL_PATCHES),
+                                                  device=device)
+                            obs1 = base_obs.clone()
+                            obs1.scatter_(1, patches_list[0], True)
+                            parts = [ctx_rep,
+                                     z_list[0] + pos_emb[patches_list[0]]]
                             if R > 0:
-                                sim_parts_s.append(
+                                rem1 = torch.sort(
+                                    torch.where(~obs1, ar_dev[None, :],
+                                                len(ALL_PATCHES)),
+                                    dim=-1).values[..., :R]
+                                parts.append(
                                     (ijepa.mask_token.view(1, 1, 1, -1)
-                                     + pos_emb[rem_pos]).reshape(
-                                        A_r * k_cand, R, -1))
-                            sim_in = torch.cat(sim_parts_s, dim=1)
+                                     + pos_emb[rem1]).reshape(rows2, R, -1))
+                            sim_in1 = torch.cat(parts, dim=1)
                             with torch.no_grad():
+                                mu_out1 = ijepa.mu_predictor(
+                                    sim_in1, patchify=False, pos_embed=False)
+                                mu1_map = F.layer_norm(
+                                    mu_out1, (mu_out1.size(-1),))[
+                                    :, -len(ALL_PATCHES):]
+                                sigma_out1 = ijepa.sigma_predictor(
+                                    sim_in1, patchify=False, pos_embed=False)
+                                sig1_map = ijepa.sigma_predictor_head(
+                                    sigma_out1)[:, -len(ALL_PATCHES):]
+                                sig1_map = sig1_map.squeeze(-1)
+                            # frozen default: no follow-up possible
+                            score = sig1_map.sum(-1)               # (rows2,)
+                            sig_masked1 = sig1_map.masked_fill(
+                                obs1, float("-inf"))
+                            pooled1 = F.avg_pool2d(
+                                sig_masked1.reshape(rows2, 1, 12, 12),
+                                kernel_size=b, stride=1).reshape(rows2, -1)
+                            invalid1 = torch.any(
+                                obs1[:, None, :] & anchor_dev[None, :],
+                                dim=-1)
+                            pooled1 = pooled1.masked_fill(invalid1,
+                                                          float("-inf"))
+                            m_level = m_cands
+                            nvalid = (~torch.isinf(pooled1)).sum(-1)
+                            active = (
+                                torch.arange(m_level, device=device)[None, :]
+                                < nvalid[:, None])
+                            order = pooled1.argsort(dim=-1, descending=True,
+                                                    stable=True)
+                            opt_anchor = order[:, :m_level]   # (rows2, m)
+                            r3_idx = active.reshape(-1).nonzero(
+                                as_tuple=True)[0]
+                            for c3a, c3b in iter_chunks(r3_idx.numel()):
+                                r3 = r3_idx[c3a:c3b]
+                                r2_of = r3 // m_level    # source rollout row
+                                ar3 = torch.arange(r3.numel(),
+                                                   device=device)[:, None]
+                                patch2 = anchor_blocks.to(device)[
+                                    opt_anchor.reshape(-1)[r3]] \
+                                    .sort(dim=-1).values
+                                z2 = (mu1_map[r2_of[:, None], patch2]
+                                      + sig1_map[r2_of[:, None], patch2]
+                                      .clamp_min(1e-12).sqrt()[..., None]
+                                      * torch.randn(
+                                          mu1_map[r2_of[:, None],
+                                                  patch2].shape,
+                                          generator=sample_gen,
+                                          device=device))
+                                obs2 = base_obs[r2_of].clone()
+                                obs2.scatter_(1, patches_list[0][r2_of], True)
+                                obs2.scatter_(1, patch2, True)
+                                parts2 = [
+                                    ctx_rep[r2_of],
+                                    z_list[0][r2_of]
+                                    + pos_emb[patches_list[0][r2_of]],
+                                    z2 + pos_emb[patch2]]
+                                rem2 = R - bb
+                                if rem2 > 0:
+                                    rem_pos2 = torch.sort(
+                                        torch.where(~obs2, ar_dev[None, :],
+                                                    len(ALL_PATCHES)),
+                                        dim=-1).values[..., :rem2]
+                                    parts2.append(
+                                        (ijepa.mask_token.view(1, 1, 1, -1)
+                                         + pos_emb[rem_pos2]).reshape(
+                                            r3.numel(), rem2, -1))
+                                sim_in2 = torch.cat(parts2, dim=1)
+                                with torch.no_grad():
+                                    sigma_out2 = ijepa.sigma_predictor(
+                                        sim_in2, patchify=False,
+                                        pos_embed=False)
+                                    sig2 = ijepa.sigma_predictor_head(
+                                        sigma_out2)[:, -len(ALL_PATCHES):]
+                                    sig2 = sig2.squeeze(-1)
+                                score = score.index_reduce(
+                                    0, r2_of, sig2.sum(-1), "amin",
+                                    include_self=True)
+                            # the finalize below reshapes obj_roll back into
+                            # obj; preload the nested score into obj_roll
+                            obj_roll = score.reshape(-1, 1).repeat(
+                                1, sim_samples).reshape(-1)
+                            L_eff = 0       # the greedy rollout loop is skipped
+                        else:
+                            done = torch.zeros(rows2, dtype=torch.bool,
+                                               device=device)
+                            obj_roll = torch.zeros(rows2, device=device)
+                            L_eff = min(sim_steps, 1 + R // bb)
+                        for l in range(1, L_eff + 1):
+                            alive = (~done).nonzero(as_tuple=True)[0]
+                            if alive.numel() == 0:
+                                break
+                            # simulated context (alive rows): the real ctx
+                            # plus the l sampled additions so far
+                            obs_alive = base_obs[alive].clone()
+                            for j in range(l):
+                                obs_alive.scatter_(
+                                    1, patches_list[j][alive], True)
+                            parts = [ctx_rep[alive]]
+                            for j in range(l):
+                                parts.append(z_list[j][alive]
+                                             + pos_emb[patches_list[j][alive]])
+                            rem_cnt = R - (l - 1) * bb
+                            if rem_cnt > 0:
+                                rem_l = torch.sort(
+                                    torch.where(
+                                        ~obs_alive,
+                                        torch.arange(len(ALL_PATCHES),
+                                                     device=device)[None, :],
+                                        len(ALL_PATCHES)),
+                                    dim=-1).values[..., :rem_cnt]
+                                parts.append(
+                                    (ijepa.mask_token.view(1, 1, 1, -1)
+                                     + pos_emb[rem_l]).reshape(
+                                        alive.numel(), rem_cnt, -1))
+                            sim_in = torch.cat(parts, dim=1)
+                            with torch.no_grad():
+                                if l < L_eff:
+                                    mu_out = ijepa.mu_predictor(
+                                        sim_in, patchify=False,
+                                        pos_embed=False)
+                                    mu_map = F.layer_norm(
+                                        mu_out, (mu_out.size(-1),))[
+                                        :, -len(ALL_PATCHES):]
                                 sigma_out = ijepa.sigma_predictor(
-                                    sim_in, patchify=False,
-                                    pos_embed=False)
-                                sig_sim = ijepa.sigma_predictor_head(
-                                    sigma_out)
-                                sig_sim = sig_sim.squeeze(-1)
-                            obj = obj + sig_sim.sum(
-                                dim=1).reshape(A_r, k_cand)
-                        obj = obj / sim_samples
-                    else:
+                                    sim_in, patchify=False, pos_embed=False)
+                                sig_map = ijepa.sigma_predictor_head(
+                                    sigma_out)[:, -len(ALL_PATCHES):]
+                                sig_map = sig_map.squeeze(-1)
+                            # score of THIS state (frozen rows keep the last)
+                            obj_roll[alive] = sig_map.sum(-1)
+                            if l >= L_eff:
+                                continue
+                            # pick the next addition: fully-unobserved anchor
+                            # with the largest pooled sigma of this state
+                            sig_masked = sig_map.masked_fill(
+                                obs_alive, float("-inf"))
+                            pooled_s = F.avg_pool2d(
+                                sig_masked.reshape(alive.numel(), 1, 12, 12),
+                                kernel_size=b, stride=1).reshape(
+                                alive.numel(), -1)
+                            invalid = torch.any(
+                                obs_alive[:, None, :] & anchor_dev[None, :],
+                                dim=-1)
+                            pooled_s = pooled_s.masked_fill(
+                                invalid, float("-inf"))
+                            no_valid = torch.isinf(pooled_s).all(dim=-1)
+                            done[alive[no_valid]] = True
+                            # keep_local_idx indexes the ALIVE sub-batch (the
+                            # forward outputs have alive.numel() rows, NOT
+                            # rows2 rows)
+                            keep_local_idx = (~no_valid).nonzero(
+                                as_tuple=True)[0]
+                            if keep_local_idx.numel():
+                                keep_idx = alive[keep_local_idx]
+                                mu_keep = mu_map[keep_local_idx]
+                                nxt = pooled_s[keep_local_idx].argmax(dim=-1)
+                                patch_l = anchor_blocks.to(device)[nxt] \
+                                    .sort(dim=-1).values
+                                ar_keep = torch.arange(
+                                    mu_keep.shape[0], device=device)[:, None]
+                                mu_at = mu_keep[ar_keep, patch_l]
+                                sig_at = sig_map[keep_local_idx][
+                                    ar_keep, patch_l]
+                                eps_l = torch.randn(mu_at.shape,
+                                                    generator=sample_gen,
+                                                    device=device)
+                                z_l = (mu_at
+                                       + sig_at.clamp_min(1e-12).sqrt()
+                                       [..., None] * eps_l)
+                                # full-row-shape appends (frozen rows keep
+                                # unused placeholders)
+                                z_full = torch.zeros(
+                                    rows2, *z_l.shape[1:], device=device)
+                                z_full[keep_idx] = z_l
+                                p_full = torch.zeros(
+                                    rows2, bb, dtype=torch.long,
+                                    device=device)
+                                p_full[keep_idx] = patch_l
+                                z_list.append(z_full)
+                                patches_list.append(p_full)
+                        obj = obj_roll.reshape(
+                            A_r, k_cand, sim_samples).mean(dim=-1)
+                    elif sampled:
                         sim_parts = [
                             ctx_feats[r].repeat_interleave(k_cand, dim=0),
                             cand_feats + pos_emb[cand_flat],
@@ -1022,14 +1292,20 @@ def main():
                              'random_center center_outward raster '
                              'raster_center ame sigma_lookahead '
                              'sigma_lookahead_center sigma_lookahead_sample '
-                             'mc_greedy mc_center mc_lookahead '
-                             'mc_lookahead_center')
+                             'sigma_lookahead_sample_ms mc_greedy mc_center '
+                             'mc_lookahead mc_lookahead_center')
     parser.add_argument('--lookahead-bs', type=int, nargs='+',
                         default=[1, 2, 3, 4], metavar='B',
                         help='block sizes for the lookahead variants '
                              '(default: all; other block sizes then run '
                              'without them, e.g. 2 3 4 to skip the very '
                              'slow b=1 lookahead)')
+    parser.add_argument('--lookahead-steps', type=int, default=2,
+                        help='simulated rollout length of '
+                             'sigma_lookahead_sample_ms (multi-step sampled '
+                             'lookahead; default 2; capped by the remaining '
+                             'fresh patches; other lookahead variants are '
+                             '1-step regardless)')
     parser.add_argument('--tlist', type=int, nargs='+', default=None,
                         help='observation step counts to sweep '
                              '(default: 1..aligned max t)')
@@ -1339,6 +1615,9 @@ def main():
                     sim_samples=(args.mc_samples
                                  if variant in SIM_LOOKAHEAD_VARIANTS
                                  else 1),
+                    sim_steps=(args.lookahead_steps
+                               if variant == "sigma_lookahead_sample_ms"
+                               else 1),
                     sample_seed=(args.mc_seed
                                  if variant in SIM_LOOKAHEAD_VARIANTS
                                  else None))

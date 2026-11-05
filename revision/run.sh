@@ -5,16 +5,43 @@
 #  revision/archive/runmcdropout_infer.sh; the old 5-seed sigma sweep in
 #  revision/archive/run.sh)
 #
-#   sigma_lookahead_sample: 1-step lookahead sigma minimisation exactly like
-#   sigma_lookahead, except that the simulated candidate features fed into
-#   the 1-step-ahead state are SAMPLES z^(k) = mu + sqrt(sigma^2) * eps of
-#   the sigma head's predictive distribution instead of the predictive mean.
-#   K independent eps per candidate (K = sim_samples; seeded by SAMPLE_SEED),
-#   one deterministic sigma-head forward per sampled simulated state, and
-#   the candidate with the smallest MEAN of the unobserved-sigma sums wins.
+#   sigma_lookahead_sample*: the family of sampled-lookahead variants of
+#   sigma_lookahead. Every simulated candidate state uses SAMPLES
+#   z^(k) = mu + sqrt(sigma^2) * eps of the sigma head's predictive
+#   distribution instead of the predictive mean (K = sim_samples, eps stream
+#   seeded by SAMPLE_SEED).
+#
+#     sigma_lookahead_sample     : L = 1 (one sampled simulated state per
+#                                  candidate) -- data already produced
+#     sigma_lookahead_sample_ms  : the greedy ROLLOUT version up to L =
+#                                  --lookahead-steps: addition 1 is the
+#                                  candidate, then the next added anchor is
+#                                  the fully-unobserved anchor with the
+#                                  largest pooled sigma of the current
+#                                  simulated state (greedy) and its feature
+#                                  is sampled from that state's own
+#                                  predictive distribution; the rollout
+#                                  score is the sigma sum of the final
+#                                  simulated state (mean over K)
+#     sigma_lookahead_sample_msn : the NESTED version (the DEFAULT run,
+#                                  depth 2, K = 1 default): the follow-up
+#                                  anchor inside the rollout is chosen THE
+#                                  SAME WAY the 1-step candidate was -- every
+#                                  one of the top-M fully-unobserved anchors
+#                                  of state 1 (after the candidate's sampled
+#                                  addition) is itself simulated with a
+#                                  sampled addition z2 ~ N(mu1, sigma1^2),
+#                                  and the anchor whose resulting state
+#                                  leaves the smallest sigma sum wins; the
+#                                  rollout score is that best (min) sigma
+#                                  sum (mean over K). Cost ~ M*(2+M)
+#                                  predictor forwards per real step
+#                                  (M = --M prescreen) -> roughly 15-25x the
+#                                  old sigma_lookahead selection cost.
+#
 #   The prescreen and every other mechanism (top-M prescreen, duplicate-free
 #   truncation, sigma_sum / sigma_rank recording) are identical to
-#   sigma_lookahead; only the counterfactual state is sampled instead of
+#   sigma_lookahead; only the counterfactual state(s) are sampled instead of
 #   deterministic.
 #
 #     Step 0 (optional, RUN_CALIB=1): plain sigma calibration (the same
@@ -53,21 +80,18 @@
 #   upfront by the checkpoint path name ("mcdropout"), since sampling from
 #   its untrained head would silently degenerate.
 #
-#   Per-(K, seed) outputs (nothing of the other seeds/Ks is touched):
-#     images/rec_images_sigmasample_k{K}/seed_{s}/b{b}/
+#   Per-(K, seed) outputs (nothing of the other Ks/seeds is touched):
+#     images/rec_images_sigmasample_msn_k{K}/seed_{s}/b{b}/      (msn default)
 #         rec_error_vs_t.png / .csv / .pt, sigma_sum_traj.pt
 #         (sigma_sum + sigma_rank),
 #         gallery/nXXXX.png (first --gallery_n samples)
-#     selected_patch_index/sigmasample_k{K}/seed_{s}/block_{b}_tmax_32_{variant}.json
+#     selected_patch_index/sigmasample_msn_k{K}/seed_{s}/
+#         block_{b}_tmax_32_{variant}.json
+#     (the greedy ms variant lands in sigmasample_L{L}_k{K} instead)
 #     init_blocks/seed_{s}.pt (shared init blocks, reproduced from the old run)
-#     result_sigmasample_k{K}_seed_{s}.zip  packed at the end of the seed's run
-#     result_sigmasample_k{K}.zip           bundles the K's seed zips (nested)
-#     result.zip                            bundles EVERY per-(K, seed) zip
-#                                           (the single file to share)
-#
-#   K = 1 (pure single-sample lookahead: one eps draw per candidate, no
-#   averaging) and K = 4 (mean of 4 sampled simulations) run SEPARATELY, so
-#   the two K readings never overwrite each other's artefacts.
+#     result_sigmasample_msn_k{K}_seed_{s}.zip packed at the end of the run
+#     result_sigmasample_msn_k{K}.zip          bundles the K's seed zips
+#     result.zip                               bundles EVERY per-(K, seed) zip
 #
 #   NOTE: a (re)run OVERWRITES the artefacts of the seeds it processes and
 #   the init blocks they re-extract (existing init pts are reused unless
@@ -88,15 +112,20 @@
 #                                                #  dirs (default
 #                                                #  selected_patch_index,
 #                                                #  one seed_{s} dir each)
-#     KS="1 4" ...                               # predictive-distribution
-#                                                #  samples of
-#                                                #  sigma_lookahead_sample to
-#                                                #  run (default "1 4"; each K
-#                                                #  is its own pse run with
+#     KS="1" ...                                 # predictive-distribution
+#                                                #  samples (K rollouts per
+#                                                #  candidate) to run
+#                                                #  (default "1"; each K is
+#                                                #  its own pse run with
 #                                                #  --mc-samples K; K=1 means
 #                                                #  a single eps draw per
 #                                                #  candidate -- NOT the
 #                                                #  predictive mean)
+#     LSTEPS=3 ...                               # simulated rollout length
+#                                                #  of sigma_lookahead_sample_ms
+#                                                #  (default 2; L=1 is the
+#                                                #  plain sigma_lookahead_sample;
+#                                                #  msn, the default, ignores it)
 #     SAMPLE_SEED=0 ...                          # torch seed of the eps
 #                                                #  streams (default 0;
 #                                                #  =--mc-seed; identical
@@ -104,10 +133,13 @@
 #     LOOKAHEAD_M=8 ...                          # lookahead candidate prescreen
 #                                                #  (default 16 = the old sweep;
 #                                                #  ALL_CANDIDATES=1 disables
-#                                                #  the prescreen)
+#                                                #  the prescreen; for msn this
+#                                                #  is ALSO the nested c2 panel)
 #     VARIANTS_LIST="..." ...                    # (default:
-#                                                #  sigma_lookahead_sample;
-#                                                #  sigma_greedy /
+#                                                #  sigma_lookahead_sample_msn;
+#                                                #  the 1-step
+#                                                #  sigma_lookahead_sample data
+#                                                #  already exists; sigma_greedy /
 #                                                #  sigma_lookahead come from
 #                                                #  the OLD sweep's artefacts)
 #     RUN_CALIB=1 ...                            # redo the plain sigma
@@ -120,12 +152,14 @@
 #                                                #  instead, which breaks the
 #                                                #  pairing with the old run)
 #     SKIP_ZIP=1 ...                             # skip packaging
-#     ZIP_PREFIX=result_sigmasample_k{K} ...     # zip base name per K
+#     ZIP_PREFIX=result_sigmasample_msn_k{K} ... # zip base name per K
 #
-#   Runtime at N=8000 (24 GB GPU) per seed: K=1's selection is the old
-#   sigma_lookahead cost (~30-50 min), K=4's is ~4x that (~2-3 h), each run
-#   adds an MAE sweep (~1.5-2 h) -> the two-K default is roughly 5-7 h per
-#   seed (~1-1.5 days for the 5 seeds); measure with N=100 first.
+#   Runtime at N=8000 (24 GB GPU) per seed (msn default, K=1): the selection
+#   runs ~M*(2+M) = 16*18 forwards per real step vs the old sigma_lookahead's
+#   1 -> ~15-25x the old lookahead selection cost (~8-14 h), plus the MAE
+#   sweep (~1.5-2 h) -> roughly a day per seed (~4-5 days for the 5 seeds
+#   sequentially). The greedy ms variant (L=2, K=1) is ~3x the old cost
+#   (~1.5-2.5 h selection). Measure with N=100 first.
 #
 #   Requires: torch, torchvision, numpy, matplotlib, einops, tqdm.
 #   STL10 data is resolved by data_utils.py: if the server data directory
@@ -146,8 +180,10 @@ DEVICE=${DEVICE:-cuda:0}  # override with e.g. DEVICE=cpu
 GALLERY_N=${GALLERY_N:-10}
 LOOKAHEAD_M=${M:-16}      # lookahead candidate prescreen size
 LOOKAHEAD_BS=${LOOKAHEAD_BS:-"2 3 4"} # block sizes that run the lookahead
-VARIANTS_LIST=${VARIANTS_LIST:-"sigma_lookahead_sample"}
-KS=${KS:-"1 4"}           # sample-count runs of the new variant (1 = single draw)
+VARIANTS_LIST=${VARIANTS_LIST:-"sigma_lookahead_sample_msn"}
+KS=${KS:-"1"}             # sample-count runs (1 = single draw; e.g. KS="1 4")
+LSTEPS=${LSTEPS:-2}       # rollout length of the GREEDY ms variant (ignored
+                          # by msn, the default, whose depth is fixed at 2)
 SAMPLE_SEED=${SAMPLE_SEED:-0} # torch seed of the eps streams (-> --mc-seed)
 MODEL_PATH=${MODEL_PATH:-models/embdim=512_epoch=300_patchsize=8/training_model.pth}
 MAE_MODEL_PATH=${MAE_MODEL_PATH:-models/mae/latest.ckpt}
@@ -165,7 +201,7 @@ if [ "${ALL_CANDIDATES:-0}" = "1" ]; then
 fi
 
 echo "python : $($PY --version 2>&1)"
-echo "params : N=$N   bs=$BS   seeds=[$SEEDS]   device=$DEVICE   gallery_n=$GALLERY_N   KS=[$KS]   sample_seed=$SAMPLE_SEED   M=$LOOKAHEAD_M   lookahead_bs=[$LOOKAHEAD_BS]   old_json_base=$OLD_JSON_BASE   model=$MODEL_PATH"
+echo "params : N=$N   bs=$BS   seeds=[$SEEDS]   device=$DEVICE   gallery_n=$GALLERY_N   KS=[$KS]   L=$LSTEPS   sample_seed=$SAMPLE_SEED   M=$LOOKAHEAD_M   lookahead_bs=[$LOOKAHEAD_BS]   old_json_base=$OLD_JSON_BASE   model=$MODEL_PATH"
 
 # per-seed sanity check of the old-JSON locations before any heavy step
 if [ "${SKIP_INIT:-0}" != "1" ]; then
@@ -233,7 +269,10 @@ fi
 for K in $KS; do
 for SEED in $SEEDS; do
     SEED_DIR="seed_${SEED}"
-    TAG_K="${OUT_TAG}_k${K}"
+    case "$VARIANTS_LIST" in
+        *msn*) TAG_K="sigmasample_msn_k${K}";;
+        *)     TAG_K="sigmasample_L${LSTEPS}_k${K}";;
+    esac
     REC_DIR="images/rec_images_${TAG_K}/${SEED_DIR}"
     JSON_DIR="selected_patch_index/${TAG_K}/${SEED_DIR}"
     INIT_ARGS=""
@@ -253,6 +292,7 @@ for SEED in $SEEDS; do
         --lookahead-bs $LOOKAHEAD_BS \
         --variants $VARIANTS_LIST \
         $LOOKAHEAD_FLAGS \
+        --lookahead-steps "$LSTEPS" \
         --mc-samples "$K" \
         --mc-seed "$SAMPLE_SEED" \
         $INIT_ARGS \
@@ -265,7 +305,7 @@ for SEED in $SEEDS; do
     # Package this (K, seed)'s artefacts (+ the seed's init blocks) into a zip
     # -------------------------------------------------------------------------
     if [ "${SKIP_ZIP:-0}" != "1" ]; then
-        ZIP="${ZIP_PREFIX:-result_sigmasample_k${K}}_${SEED_DIR}.zip"
+        ZIP="${ZIP_PREFIX:-result_${TAG_K}}_${SEED_DIR}.zip"
         echo ""
         echo "=== Pack artefacts into $ZIP ===================================="
         rm -f "$ZIP"
@@ -295,7 +335,7 @@ done
 # -----------------------------------------------------------------------------
 if [ "${SKIP_ZIP:-0}" != "1" ]; then
     for K in $KS; do
-        K_PREFIX="${ZIP_PREFIX:-result_sigmasample_k${K}}"
+        K_PREFIX="${ZIP_PREFIX:-result_${TAG_K}}"
         RESULT_ZIP="${K_PREFIX}.zip"
         echo ""
         echo "=== Bundle per-seed zips into $RESULT_ZIP ======================="
