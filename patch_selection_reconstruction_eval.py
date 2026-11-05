@@ -872,13 +872,15 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                                                           float("-inf"))
                             m_level = m_cands
                             nvalid = (~torch.isinf(pooled1)).sum(-1)
-                            active = (
+                            # NOTE: this local MUST NOT shadow the outer
+                            # active-image list of the while loop
+                            opt_active = (
                                 torch.arange(m_level, device=device)[None, :]
                                 < nvalid[:, None])
                             order = pooled1.argsort(dim=-1, descending=True,
                                                     stable=True)
                             opt_anchor = order[:, :m_level]   # (rows2, m)
-                            r3_idx = active.reshape(-1).nonzero(
+                            r3_idx = opt_active.reshape(-1).nonzero(
                                 as_tuple=True)[0]
                             for c3a, c3b in iter_chunks(r3_idx.numel()):
                                 r3 = r3_idx[c3a:c3b]
