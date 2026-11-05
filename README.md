@@ -12,7 +12,7 @@
 ## 実行
 
 ```bash
-DEVICE=cuda:1 bash revision/run.sh 2>&1 | tee eval_sigmasample.log
+DEVICE=cuda:1 bash revision/run.sh 2>&1 | tee eval_sigmasample_ms2.log
 ```
 
 ## 成果物の保存先
@@ -28,13 +28,13 @@ DEVICE=cuda:1 bash revision/run.sh 2>&1 | tee eval_sigmasample.log
 | まとめzip(実行終了時に自動生成) | `result_sigmasample_ms2_k{K}_seed_{s}.zip` ×{各seed} + `result_sigmasample_ms2_k{K}.zip` + 全部まとめた**`result.zip`**(共有はこれ一つでOK) |
 
 既定の実行: variant **`sigma_lookahead_sample_ms2`**(ペア観測版・深さ2), **K=1**。
-msnと同一のネスト計画(「c1+最善続き1手」の2手プランを模擬でスコア化)でc1と後続の
-**両方**を選び、**実際の観測として2ブロックを一度に追加**する(L=2のプランをそのまま
-実行; ただし最後の1ブロック分だけ余っている場合はc1のみ)。t軸は「観測済みblock数」
+msnと同一のネスト計画(「c1+最善の続き1手」の2手プランを模擬でスコア化し、スコア最小の
+c2を内定)で、**内定した2ブロック両方を実際に観測として追加**する(L=2のプランをそのまま
+実行; 残り1ブロック分のbudgetしかない最終段階ではc1のみ)。t軸は「観測済みblock数」
 のままなので、1ブロック/ステップの他variantと同一軸で比較可能。
-プランのパネル: c2候補も`--M`(既定16)。K本rollout(既定K=1は単一サンプル)。
-フォワード ~M(2+M)/real stepだがreal stepが半分 → 選択コストはmsnの約半分
-(**~4.5–7.5h/seed**)。`KS`/`LOOKAHEAD_M`で任意変更。成果物は
+c2候補のパネルは`--M`(既定16)と共有。ロールアウトはK本(既定K=1=単一サンプル)。
+forward ~M(2+M)/real stepだがreal stepが半分になるため、選択コストはmsnの約半分
+(**選択~4.5–7.5h/seed**)。`KS`/`LOOKAHEAD_M`で任意変更。成果物は
 `sigmasample_ms2_k{K}`ディレクトリに分離(msn=`sigmasample_msn_k{K}`,
 greedy ms=`sigmasample_L{L}_k{K}`, 1-step版データは
 `results/STL10_lookahead_sample`にあり)。σ_greedy/σ_lookaheadの曲線は旧σ実験
