@@ -62,6 +62,25 @@
 #                     (mean over the K rollouts), freezing when no
 #                     fully-unobserved anchor remains. Requires the sigma-
 #                     head I-JEPA checkpoint like sigma_lookahead_sample.
+#   sigma_lookahead_sample_msn
+#                     nested depth-2 version of sigma_lookahead_sample: the
+#                     follow-up anchor inside the rollout is chosen THE SAME
+#                     WAY the 1-step candidate was (each top-M option of the
+#                     state after addition 1 is itself simulated with a
+#                     sampled addition, and the min-sigma-sum option wins);
+#                     the rollout score is that best (min) sigma sum. Only
+#                     the CANDIDATE is observed per real step (the plan is
+#                     for scoring).
+#   sigma_lookahead_sample_ms2
+#                     the pair-observing variant (the DEFAULT run): the SAME
+#                     nested depth-2 planning as msn, but BOTH chosen blocks
+#                     (the candidate AND its best follow-up) are added to the
+#                     context per real step -- observations advance 2 blocks
+#                     per step (the final step adds one block when only one
+#                     block's budget remains). The t axis still counts
+#                     OBSERVED blocks, so the curves stay comparable with the
+#                     1-block-per-step variants; selection cost ~ half of
+#                     msn. Requires the sigma-head checkpoint.
 #   sigma_lookahead_center
 #                     same as sigma_lookahead but the initial block is the
 #                     center block
@@ -205,6 +224,7 @@ VARIANTS = [
     "sigma_lookahead_sample",
     "sigma_lookahead_sample_ms",
     "sigma_lookahead_sample_msn",
+    "sigma_lookahead_sample_ms2",
     "mc_greedy",
     "mc_center",
     "mc_lookahead",
@@ -214,7 +234,7 @@ SIGMA_VARIANTS = ["sigma_greedy", "sigma_center"]
 MC_VARIANTS = ["mc_greedy", "mc_center"]
 LOOKAHEAD_VARIANTS = ["sigma_lookahead", "sigma_lookahead_center",
                       "sigma_lookahead_sample", "sigma_lookahead_sample_ms",
-                      "sigma_lookahead_sample_msn",
+                      "sigma_lookahead_sample_msn", "sigma_lookahead_sample_ms2",
                       "mc_lookahead", "mc_lookahead_center"]
 MC_LOOKAHEAD_VARIANTS = ["mc_lookahead", "mc_lookahead_center"]
 # sampled simulation: instead of the predictive mean, the candidate features
@@ -235,11 +255,16 @@ MC_LOOKAHEAD_VARIANTS = ["mc_lookahead", "mc_lookahead_center"]
 # sigma sum over the follow-up options, mean over K rollouts. Depth 2
 # (candidate + one nested level), cost ~ M*(M+2) forwards per real step.
 SIM_LOOKAHEAD_VARIANTS = ["sigma_lookahead_sample", "sigma_lookahead_sample_ms",
-                          "sigma_lookahead_sample_msn"]
+                          "sigma_lookahead_sample_msn",
+                          "sigma_lookahead_sample_ms2"]
 # nested variant: the follow-up anchor inside the rollout is chosen like the
 # 1-step candidate itself (each top-M option of the simulated state is
 # simulated with a sampled addition, and the min-sigma-sum one wins)
 SIM_NESTED_LOOKAHEAD_VARIANTS = ["sigma_lookahead_sample_msn"]
+# pair-observing variant (ms2): the nested depth-2 plan's TWO chosen blocks
+# (candidate + its best follow-up) are BOTH added to the context per real
+# step, so observations advance 2 blocks per step
+SIM_PAIR_LOOKAHEAD_VARIANTS = ["sigma_lookahead_sample_ms2"]
 OUT_DIR = "images/rec_images_tmax32"
 
 ALL_PATCHES = list(range(144))
@@ -709,7 +734,12 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                                     device=device)
                 sub = max(1, CHUNK_SIZE // k_cand)
                 if sampled and (variant in SIM_NESTED_LOOKAHEAD_VARIANTS
+                                or variant in SIM_PAIR_LOOKAHEAD_VARIANTS
                                 or sim_steps > 1):
+                    # the rollout rows2 = rows * sim_samples (and the
+                    # nested scoring adds an options axis below): keep the
+                    # per-forward row count within CHUNK for every arm
+                    sub = max(1, CHUNK_SIZE // (k_cand * sim_samples))
                     # the rollout rows2 = rows * sim_samples (and the
                     # nested scoring adds an options axis below): keep the
                     # per-forward row count within CHUNK for every arm
@@ -738,6 +768,7 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                     cand_feats = preds[r][i_rep[:, None], cand_flat]
 
                     if sampled and (variant in SIM_NESTED_LOOKAHEAD_VARIANTS
+                                    or variant in SIM_PAIR_LOOKAHEAD_VARIANTS
                                     or sim_steps > 1):
                         # multi-step sampled rollout (sigma_lookahead_sample_
                         # ms): prescreen = plain sigma map (above); each of
@@ -779,21 +810,28 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                                                 generator=sample_gen,
                                                 device=device)]
                         patches_list = [cand_ms]
-                        if variant in SIM_NESTED_LOOKAHEAD_VARIANTS:
+                        if (variant in SIM_NESTED_LOOKAHEAD_VARIANTS
+                                or variant in SIM_PAIR_LOOKAHEAD_VARIANTS):
                             # ---- NESTED rollout (sigma_lookahead_sample_
-                            # msn): depth-2 planning. State 1 = state0 + the
-                            # candidate's sampled addition (z1 above); its
-                            # (mu1, sigma1) maps define the follow-up options:
-                            # every one of the top-m_cands fully-unobserved
-                            # anchors of state1 (by pooled sigma) is itself
-                            # simulated with a sampled addition z2 ~ N(mu1,
-                            # sigma1^2), the resulting sigma sums are reduced
-                            # with amin per rollout row, and score(c1) is the
-                            # MIN over the follow-up options (mean over the K
-                            # rollouts). Rows whose state1 offers no
-                            # fully-unobserved anchor freeze at
+                            # msn / _ms2): depth-2 planning. State 1 = state0
+                            # + the candidate's sampled addition (z1 above);
+                            # its (mu1, sigma1) maps define the follow-up
+                            # options: every one of the top-m_cands fully-
+                            # unobserved anchors of state1 (by pooled sigma)
+                            # is itself simulated with a sampled addition
+                            # z2 ~ N(mu1, sigma1^2), the resulting sigma sums
+                            # are reduced with amin per rollout row, and
+                            # score(c1) is the MIN over the follow-up options
+                            # (mean over the K rollouts). Rows whose state1
+                            # offers no fully-unobserved anchor freeze at
                             # sigma_sum(state1). Cost ~ m_cands forward pairs
                             # per (candidate x rollout) beyond state 1.
+                            # The _ms2 variant additionally OBSERVES the
+                            # winning follow-up together with the candidate
+                            # (2 blocks per real step; see the apply loop).
+                            best_c2 = torch.full(
+                                (rows.numel() * k_cand * sim_samples,), -1,
+                                dtype=torch.long, device=device)
                             ar_dev = torch.arange(len(ALL_PATCHES),
                                                   device=device)
                             obs1 = base_obs.clone()
@@ -884,6 +922,16 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                                     sig2 = ijepa.sigma_predictor_head(
                                         sigma_out2)[:, -len(ALL_PATCHES):]
                                     sig2 = sig2.squeeze(-1)
+                                # best_c2 tracking (for the pair-observing
+                                # variant): a follow-up option replaces the
+                                # winning slot only when it beats the
+                                # current score (the frozen sigma_sum(state1)
+                                # keeps the -1 = "no planned follow-up")
+                                r3_global = (s0 * k_cand * sim_samples
+                                             + r2_of)
+                                improved = sig2.sum(-1) < score[r2_of]
+                                best_c2[r3_global[improved]] = \
+                                    opt_anchor.reshape(-1)[r3[improved]]
                                 score = score.index_reduce(
                                     0, r2_of, sig2.sum(-1), "amin",
                                     include_self=True)
@@ -992,7 +1040,7 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                                 patches_list.append(p_full)
                         obj = obj_roll.reshape(
                             A_r, k_cand, sim_samples).mean(dim=-1)
-                    elif sampled:
+                    else:
                         sim_parts = [
                             ctx_feats[r].repeat_interleave(k_cand, dim=0),
                             cand_feats + pos_emb[cand_flat],
@@ -1028,12 +1076,40 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                 sig_rank[np.asarray(act)[rows.cpu().numpy()], t_now - 1] = \
                     (best_r + 1).cpu().numpy()
 
+            # per-image real additions: the pair-observing variant (ms2) adds
+            # BOTH blocks of the nested depth-2 plan -- candidates and their
+            # planned follow-ups -- but keeps every selectable image in
+            # LOCK-STEP: the chunked forwards assume one uniform context
+            # length, so the 2-block addition is applied only when ALL
+            # selectable images have a planned follow-up and room for it;
+            # otherwise every image adds just the chosen candidate this step
+            # (and the pairing resumes once the stragglers catch up)
+            follows, rooms = {}, {}
+            pair_each = variant in SIM_PAIR_LOOKAHEAD_VARIANTS
+            single_only = False
+            for row in range(A):
+                if best_anchor[row] < 0:
+                    continue
+                i = act[row]
+                fu = -1
+                if pair_each:
+                    base = row * k_cand * sim_samples
+                    cand_slot = int(best_r[row])
+                    fu = int(best_c2[base + cand_slot * sim_samples])
+                follows[row] = fu
+                rooms[row] = max_steps - steps[i]
+                if pair_each and (fu < 0 or rooms[row] < 2):
+                    single_only = True
             for row in range(A):
                 if best_anchor[row] < 0:
                     continue        # truncation: no fully-unobserved anchor
                 i = act[row]
                 contexts[i].extend(anchor_patches[int(best_anchor[row])])
                 steps[i] += 1
+                if (pair_each and not single_only
+                        and follows[row] >= 0 and rooms[row] >= 2):
+                    contexts[i].extend(anchor_patches[follows[row]])
+                    steps[i] += 1
                 still.append(i)
         active = still
         step += 1
@@ -1292,7 +1368,9 @@ def main():
                              'random_center center_outward raster '
                              'raster_center ame sigma_lookahead '
                              'sigma_lookahead_center sigma_lookahead_sample '
-                             'sigma_lookahead_sample_ms mc_greedy mc_center '
+                             'sigma_lookahead_sample_ms '
+                             'sigma_lookahead_sample_msn '
+                             'sigma_lookahead_sample_ms2 mc_greedy mc_center '
                              'mc_lookahead mc_lookahead_center')
     parser.add_argument('--lookahead-bs', type=int, nargs='+',
                         default=[1, 2, 3, 4], metavar='B',

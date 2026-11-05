@@ -23,21 +23,19 @@
 #                                  predictive distribution; the rollout
 #                                  score is the sigma sum of the final
 #                                  simulated state (mean over K)
-#     sigma_lookahead_sample_msn : the NESTED version (the DEFAULT run,
-#                                  depth 2, K = 1 default): the follow-up
-#                                  anchor inside the rollout is chosen THE
-#                                  SAME WAY the 1-step candidate was -- every
-#                                  one of the top-M fully-unobserved anchors
-#                                  of state 1 (after the candidate's sampled
-#                                  addition) is itself simulated with a
-#                                  sampled addition z2 ~ N(mu1, sigma1^2),
-#                                  and the anchor whose resulting state
-#                                  leaves the smallest sigma sum wins; the
-#                                  rollout score is that best (min) sigma
-#                                  sum (mean over K). Cost ~ M*(2+M)
-#                                  predictor forwards per real step
-#                                  (M = --M prescreen) -> roughly 15-25x the
-#                                  old sigma_lookahead selection cost.
+#     sigma_lookahead_sample_msn : the NESTED version (depth 2, K = 1 default)
+#     sigma_lookahead_sample_ms2 : the DEFAULT run -- the SAME nested depth-2
+#                                  planning as msn, but the plan's TWO chosen
+#                                  blocks are BOTH OBSERVED per real step
+#                                  (candidate + its best follow-up), so the
+#                                  observations advance 2 blocks per step
+#                                  (the last step adds a single block when
+#                                  only one block's budget remains); the
+#                                  t axis still counts OBSERVED blocks, so
+#                                  the curves stay comparable with the
+#                                  1-block-per-step variants on the same
+#                                  axis; selection cost ~= half of msn
+#                                  (half as many real steps).
 #
 #   The prescreen and every other mechanism (top-M prescreen, duplicate-free
 #   truncation, sigma_sum / sigma_rank recording) are identical to
@@ -81,16 +79,17 @@
 #   its untrained head would silently degenerate.
 #
 #   Per-(K, seed) outputs (nothing of the other Ks/seeds is touched):
-#     images/rec_images_sigmasample_msn_k{K}/seed_{s}/b{b}/      (msn default)
+#     images/rec_images_sigmasample_ms2_k{K}/seed_{s}/b{b}/     (ms2 default)
 #         rec_error_vs_t.png / .csv / .pt, sigma_sum_traj.pt
 #         (sigma_sum + sigma_rank),
 #         gallery/nXXXX.png (first --gallery_n samples)
-#     selected_patch_index/sigmasample_msn_k{K}/seed_{s}/
+#     selected_patch_index/sigmasample_ms2_k{K}/seed_{s}/
 #         block_{b}_tmax_32_{variant}.json
-#     (the greedy ms variant lands in sigmasample_L{L}_k{K} instead)
+#     (msn lands in sigmasample_msn_k{K}, the greedy ms in
+#      sigmasample_L{L}_k{K})
 #     init_blocks/seed_{s}.pt (shared init blocks, reproduced from the old run)
-#     result_sigmasample_msn_k{K}_seed_{s}.zip packed at the end of the run
-#     result_sigmasample_msn_k{K}.zip          bundles the K's seed zips
+#     result_sigmasample_ms2_k{K}_seed_{s}.zip packed at the end of the run
+#     result_sigmasample_ms2_k{K}.zip          bundles the K's seed zips
 #     result.zip                               bundles EVERY per-(K, seed) zip
 #
 #   NOTE: a (re)run OVERWRITES the artefacts of the seeds it processes and
@@ -136,7 +135,7 @@
 #                                                #  the prescreen; for msn this
 #                                                #  is ALSO the nested c2 panel)
 #     VARIANTS_LIST="..." ...                    # (default:
-#                                                #  sigma_lookahead_sample_msn;
+#                                                #  sigma_lookahead_sample_ms2;
 #                                                #  the 1-step
 #                                                #  sigma_lookahead_sample data
 #                                                #  already exists; sigma_greedy /
@@ -152,14 +151,15 @@
 #                                                #  instead, which breaks the
 #                                                #  pairing with the old run)
 #     SKIP_ZIP=1 ...                             # skip packaging
-#     ZIP_PREFIX=result_sigmasample_msn_k{K} ... # zip base name per K
+#     ZIP_PREFIX=result_sigmasample_ms2_k{K} ... # zip base name per K
 #
-#   Runtime at N=8000 (24 GB GPU) per seed (msn default, K=1): the selection
-#   runs ~M*(2+M) = 16*18 forwards per real step vs the old sigma_lookahead's
-#   1 -> ~15-25x the old lookahead selection cost (~8-14 h), plus the MAE
-#   sweep (~1.5-2 h) -> roughly a day per seed (~4-5 days for the 5 seeds
-#   sequentially). The greedy ms variant (L=2, K=1) is ~3x the old cost
-#   (~1.5-2.5 h selection). Measure with N=100 first.
+#   Runtime at N=8000 (24 GB GPU) per seed (ms2 default, K=1): the nested
+#   scoring runs ~M*(2+M) forwards per real step but each real step consumes
+#   TWO blocks, i.e. half as many real steps as msn -> ~half of the msn
+#   selection cost (~4.5-7.5 h), plus the MAE sweep (~1.5-2 h) -> roughly
+#   6-9 h per seed (~1.3-2 days for the 5 seeds sequentially). The greedy ms
+#   variant (L=2, K=1) is ~3x the old cost (~1.5-2.5 h selection). Measure
+#   with N=100 first.
 #
 #   Requires: torch, torchvision, numpy, matplotlib, einops, tqdm.
 #   STL10 data is resolved by data_utils.py: if the server data directory
@@ -180,10 +180,10 @@ DEVICE=${DEVICE:-cuda:0}  # override with e.g. DEVICE=cpu
 GALLERY_N=${GALLERY_N:-10}
 LOOKAHEAD_M=${M:-16}      # lookahead candidate prescreen size
 LOOKAHEAD_BS=${LOOKAHEAD_BS:-"2 3 4"} # block sizes that run the lookahead
-VARIANTS_LIST=${VARIANTS_LIST:-"sigma_lookahead_sample_msn"}
+VARIANTS_LIST=${VARIANTS_LIST:-"sigma_lookahead_sample_ms2"}
 KS=${KS:-"1"}             # sample-count runs (1 = single draw; e.g. KS="1 4")
 LSTEPS=${LSTEPS:-2}       # rollout length of the GREEDY ms variant (ignored
-                          # by msn, the default, whose depth is fixed at 2)
+                          # by ms2/msn, the depth-2 variants)
 SAMPLE_SEED=${SAMPLE_SEED:-0} # torch seed of the eps streams (-> --mc-seed)
 MODEL_PATH=${MODEL_PATH:-models/embdim=512_epoch=300_patchsize=8/training_model.pth}
 MAE_MODEL_PATH=${MAE_MODEL_PATH:-models/mae/latest.ckpt}
@@ -270,6 +270,7 @@ for K in $KS; do
 for SEED in $SEEDS; do
     SEED_DIR="seed_${SEED}"
     case "$VARIANTS_LIST" in
+        *ms2*) TAG_K="sigmasample_ms2_k${K}";;
         *msn*) TAG_K="sigmasample_msn_k${K}";;
         *)     TAG_K="sigmasample_L${LSTEPS}_k${K}";;
     esac
