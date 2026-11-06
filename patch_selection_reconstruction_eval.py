@@ -1086,6 +1086,13 @@ def select_lookahead(variant, ijepa, imgs, b, device,
             # selectable images have a planned follow-up and room for it;
             # otherwise every image adds just the chosen candidate this step
             # (and the pairing resumes once the stragglers catch up)
+            # NOTE: best_r / best_c2 are indexed in ROWS-SPACE (positions of
+            # the images with a valid anchor), while the apply loop iterates
+            # BATCH positions; map between them once per iteration
+            inv_rows = torch.full((A,), -1, dtype=torch.long,
+                                  device=rows.device)
+            inv_rows[rows] = torch.arange(rows.numel(),
+                                          device=rows.device)
             follows, rooms = {}, {}
             pair_each = variant in SIM_PAIR_LOOKAHEAD_VARIANTS
             single_only = False
@@ -1095,8 +1102,10 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                 i = act[row]
                 fu = -1
                 if pair_each:
-                    base = row * k_cand * sim_samples
-                    cand_slot = int(best_r[row])
+                    pos = int(inv_rows[row])
+                    assert pos >= 0
+                    base = pos * k_cand * sim_samples
+                    cand_slot = int(best_r[pos])
                     fu = int(best_c2[base + cand_slot * sim_samples])
                 follows[row] = fu
                 rooms[row] = max_steps - steps[i]
