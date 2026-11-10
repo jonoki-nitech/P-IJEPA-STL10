@@ -153,13 +153,16 @@
 #     SKIP_ZIP=1 ...                             # skip packaging
 #     ZIP_PREFIX=result_sigmasample_ms2_k{K} ... # zip base name per K
 #
-#   Runtime at N=8000 (24 GB GPU) per seed (ms2 default, K=1): the nested
-#   scoring runs ~M*(2+M) forwards per real step but each real step consumes
-#   TWO blocks, i.e. half as many real steps as msn -> ~half of the msn
-#   selection cost (~4.5-7.5 h), plus the MAE sweep (~1.5-2 h) -> roughly
-#   6-9 h per seed (~1.3-2 days for the 5 seeds sequentially). The greedy ms
-#   variant (L=2, K=1) is ~3x the old cost (~1.5-2.5 h selection). Measure
-#   with N=100 first.
+#   Runtime at N=8000 per seed (enum2 default, K=1): the enumerated scoring
+#   processes ~(1 + 2*M) = 33x the rows of the old sigma_lookahead per real
+#   step (level-1 mean sims, the per-sequence state' mu+sigma passes, and
+#   the state2 sigma passes) but each real step consumes TWO blocks (half as
+#   many real steps) -> the selection is ~16x the old sigma_lookahead cost
+#   (~8-14 h/seed), plus the evaluation stages (~5-10 min) -> roughly 8-14 h
+#   per seed (~2-3 days for the 5 seeds sequentially at CHUNK=1024). With
+#   the 96 GB default CHUNK=8192 expect ~25-50% faster. The other variants:
+#   ms2 ~9x, ms ~3x the old cost. Measure with N=100 first (also verifies
+#   the CHUNK=8192 memory headroom).
 #
 #   Requires: torch, torchvision, numpy, matplotlib, einops, tqdm.
 #   STL10 data is resolved by data_utils.py: if the server data directory
@@ -180,14 +183,16 @@ DEVICE=${DEVICE:-cuda:0}  # override with e.g. DEVICE=cpu
 GALLERY_N=${GALLERY_N:-10}
 LOOKAHEAD_M=${M:-16}      # lookahead candidate prescreen size
 LOOKAHEAD_BS=${LOOKAHEAD_BS:-"2 3 4"} # block sizes that run the lookahead
-VARIANTS_LIST=${VARIANTS_LIST:-"sigma_lookahead_sample_ms2"}
+VARIANTS_LIST=${VARIANTS_LIST:-"sigma_lookahead_sample_enum2"}
 KS=${KS:-"1"}             # sample-count runs (1 = single draw; e.g. KS="1 4")
 LSTEPS=${LSTEPS:-2}       # rollout length of the GREEDY ms variant (ignored
-                          # by ms2/msn, the depth-2 variants)
+                          # by ms2/msn/enum2, the depth-2 variants)
 SAMPLE_SEED=${SAMPLE_SEED:-0} # torch seed of the eps streams (-> --mc-seed)
 MODEL_PATH=${MODEL_PATH:-models/embdim=512_epoch=300_patchsize=8/training_model.pth}
 MAE_MODEL_PATH=${MAE_MODEL_PATH:-models/mae/latest.ckpt}
-export CHUNK=${CHUNK:-1024} # chunk size of the batched forward passes
+export CHUNK=${CHUNK:-8192} # chunk size of the batched forward passes
+                            # (8192 ~ 43 GB VRAM; default sized for the 96 GB
+                            # RTX PRO 6000; cut back to 1024-4096 on 24 GB cards)
 
 OUT_TAG="sigmasample"
 INIT_DIR="init_blocks"
@@ -270,6 +275,7 @@ for K in $KS; do
 for SEED in $SEEDS; do
     SEED_DIR="seed_${SEED}"
     case "$VARIANTS_LIST" in
+        *enum2*) TAG_K="sigmasample_enum2_k${K}";;
         *ms2*) TAG_K="sigmasample_ms2_k${K}";;
         *msn*) TAG_K="sigmasample_msn_k${K}";;
         *)     TAG_K="sigmasample_L${LSTEPS}_k${K}";;
