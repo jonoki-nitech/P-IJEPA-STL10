@@ -863,6 +863,7 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                             best_c2 = torch.full(
                                 (rows.numel() * k_cand * sim_samples,), -1,
                                 dtype=torch.long, device=device)
+                            m_level = m_cands   # the follow-up panel width = M
                             ar_dev = torch.arange(len(ALL_PATCHES),
                                                   device=device)
                             # (1) level-1 mean states (one per (img, c1)
