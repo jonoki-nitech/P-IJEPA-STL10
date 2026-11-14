@@ -903,15 +903,23 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                             optA = pooled1m.argsort(dim=-1, descending=True,
                                                     stable=True)[:, :m_cands]
                             # (2)+(3) one sampled chain per enumerated
-                            # sequence
+                            # sequence; the K chains are independent and the
+                            # sequence score is their MEAN
                             n3 = A_r * m_cands * m_level
-                            score_flat = torch.full(
-                                (n3,), float("inf"), device=device)
+                            score_sum = torch.zeros(n3, device=device)
                             f_ar = torch.arange(n3, device=device)
+                            a_of = f_ar // (m_cands * m_level)
+                            c1_of = (f_ar // m_level) % m_cands
+                            c2_of = f_ar % m_level
+                            # invalid panel slots (fewer than m_level fully
+                            # unobserved follow-ups) must never win
+                            nv0 = nvalid1m.reshape(A_r, m_cands,
+                                                   sim_samples)[:, :, 0]
+                            slot_bad = (torch.arange(m_level,
+                                                     device=device)[None,
+                                                     None, :]
+                                        >= nv0[:, :, None]).reshape(n3)
                             for k in range(sim_samples):
-                                a_of = f_ar // (m_cands * m_level)
-                                c1_of = (f_ar // m_level) % m_cands
-                                c2_of = f_ar % m_level
                                 r2_of = (a_of * (k_cand * sim_samples)
                                          + c1_of * sim_samples + k)
                                 p1 = patches_list[0][r2_of]
@@ -949,9 +957,12 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                                     sig1p = ijepa.sigma_predictor_head(
                                         sigma_outA)[:, -len(ALL_PATCHES):]
                                     sig1p = sig1p.squeeze(-1)
+                                # the follow-up patches: the c2 slot's anchor
+                                # of THIS (image, c1) row (2-D lookup; the
+                                # panel is per (a, c1), identical for every
+                                # chain k)
                                 p2 = anchor_blocks.to(device)[
-                                    optA.reshape(-1)[f_ar]] \
-                                    .sort(dim=-1).values
+                                    optA[r2_of, c2_of]].sort(dim=-1).values
                                 z2 = (mu1p[ar3, p2]
                                       + sig1p[ar3, p2].clamp_min(1e-12)
                                       .sqrt()[..., None]
@@ -987,13 +998,16 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                                 score3 = torch.where(
                                     unobs3, sig2,
                                     torch.zeros_like(sig2)).sum(-1)
-                                # only VALID panel slots may win
+                                # only VALID panel slots may win; the K
+                                # chains accumulate into the sequence score
                                 valid3 = c2_of < nvalid1m[r2_of]
                                 keep = f_ar[valid3]
-                                score_flat[keep] = score3[valid3]
+                                score_sum[keep] += score3[valid3]
                             # (4) K-mean expected uncertainty per sequence
-                            grid = score_flat.reshape(
-                                A_r, m_cands, m_level, sim_samples).mean(-1)
+                            grid = (score_sum / sim_samples).reshape(
+                                A_r, m_cands, m_level)
+                            grid = grid.masked_fill(slot_bad.reshape(
+                                A_r, m_cands, m_level), float("inf"))
                             per_c1 = grid.amin(dim=-1)   # (A_r, m_cands)
                             obj = per_c1
                             winner = grid.reshape(A_r, -1).argmin(-1)
@@ -1006,7 +1020,17 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                                                          device=device))
                                      [:, None] * (k_cand * sim_samples)
                                      + c1w[:, None] * sim_samples)
-                            best_c2[slots.reshape(-1)] = optA[r2w, c2w]
+                            # the follow-up exists only when the winner's
+                            # panel slot is VALID; with an empty level-1
+                            # panel (no fully-unobserved follow-up after the
+                            # mean addition) the pair degrades to the single
+                            # c1 addition (fu = -1, like ms2's empty plan)
+                            win_vals = optA[r2w, c2w].clone()
+                            _arE = torch.arange(A_r, device=device)
+                            win_bad = slot_bad.reshape(
+                                A_r, m_cands, m_level)[_arE, c1w, c2w]
+                            win_vals[win_bad] = -1
+                            best_c2[slots.reshape(-1)] = win_vals
                             obj_roll = per_c1.reshape(
                                 A_r * k_cand, 1).repeat(
                                 1, sim_samples).reshape(-1)

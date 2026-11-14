@@ -326,6 +326,11 @@ if os.path.isfile(init_pt):
     roots.append(init_pt)
 with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
     for root in roots:
+        if os.path.isfile(root):
+            # plain-file roots (e.g. init_blocks/seed_{s}.pt): os.walk
+            # silently yields nothing for files, so write them directly
+            zf.write(root)
+            continue
         for dirpath, _, files in os.walk(root):
             for f in files:
                 zf.write(os.path.join(dirpath, f))
