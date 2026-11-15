@@ -48,7 +48,7 @@ STEPS=${STEPS:-50}        # timed steps per model
 WARMUP=${WARMUP:-5}       # warm-up steps per model
 NUM_WORKERS=${NUM_WORKERS:-8}
 DEVICE=${DEVICE:-cuda:0}
-MODELS=${MODELS:-"ijepa"}
+MODELS=${MODELS:-"ijepa mae"}
 LOG=${LOG:-benchmark_training_time_steps${STEPS}.log}
 
 # always run from the repository root (data_utils resolves the STL-10 path
