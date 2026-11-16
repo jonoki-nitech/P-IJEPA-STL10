@@ -190,9 +190,13 @@ LSTEPS=${LSTEPS:-2}       # rollout length of the GREEDY ms variant (ignored
 SAMPLE_SEED=${SAMPLE_SEED:-0} # torch seed of the eps streams (-> --mc-seed)
 MODEL_PATH=${MODEL_PATH:-models/embdim=512_epoch=300_patchsize=8/training_model.pth}
 MAE_MODEL_PATH=${MAE_MODEL_PATH:-models/mae/latest.ckpt}
-export CHUNK=${CHUNK:-8192} # chunk size of the batched forward passes
-                            # (8192 ~ 43 GB VRAM; default sized for the 96 GB
-                            # RTX PRO 6000; cut back to 1024-4096 on 24 GB cards)
+export CHUNK=${CHUNK:-8192} # row budget of the batched simulation forwards
+                            # (the per-image prescreen chunk is additionally
+                            # capped at 2048 rows -- its attention cost grows
+                            # like B*T^2 and would OOM late steps otherwise;
+                            # at CHUNK=8192 the enum2 run peaks well below
+                            # 45 GB VRAM on the 96 GB card; cut back to
+                            # 1024-4096 on 24 GB cards)
 
 OUT_TAG="sigmasample"
 INIT_DIR="init_blocks"

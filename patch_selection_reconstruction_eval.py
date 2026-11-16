@@ -297,6 +297,15 @@ ALL_PATCHES = list(range(144))
 # chunk size (roughly: I-JEPA per-image attention transient ~5.3 MB ->
 # ~5.4 GB at chunk 1024; the 8000-image single batch would need ~43 GB).
 CHUNK_SIZE = int(os.environ.get("CHUNK", "1024"))
+# The uncertainty-map prescreen (lookahead_forward) processes ONE row per
+# image with T = t*b^2 + 144 tokens, and its attention cost grows like
+# B*T^2 in fp32 (the dots tensor of B=8000 rows at T=224 alone is ~10 GB,
+# x3 while scale/softmax intermediates are alive); late steps would
+# therefore OOM even large GPUs when the outer batch equals CHUNK. The
+# OUTER (per-image) chunk is capped independently: CHUNK keeps bounding
+# only the per-forward row count of the simulation passes, whose token
+# count is constant (144).
+OUTER_CHUNK_CAP = 2048
 
 
 def iter_chunks(n, chunk_size=None):
@@ -428,7 +437,9 @@ def select_sigma(variant, ijepa, imgs, b, device, init_blocks, mc_samples=1):
         # chunked I-JEPA forward (the custom attention materializes the
         # B x heads x tokens x tokens matrix -> must stay chunk-bounded)
         sig_c, resid_c, err_c = [], [], []
-        for c0, c1 in iter_chunks(len(active)):
+        for c0, c1 in iter_chunks(len(active),
+                                  chunk_size=min(CHUNK_SIZE,
+                                                 OUTER_CHUNK_CAP)):
             s, r, e = ijepa_forward_batch(
                 ijepa, batch[c0:c1], ctx[c0:c1], mc_samples=mc_samples)
             sig_c.append(s)
@@ -700,7 +711,9 @@ def select_lookahead(variant, ijepa, imgs, b, device,
 
     while active and step < max_steps:
         still = []
-        for c0, c1 in iter_chunks(len(active)):
+        for c0, c1 in iter_chunks(len(active),
+                                  chunk_size=min(CHUNK_SIZE,
+                                                 OUTER_CHUNK_CAP)):
             act = active[c0:c1]
             idx = torch.tensor(act, device=device)
             batch = img_t[idx]
@@ -1035,6 +1048,14 @@ def select_lookahead(variant, ijepa, imgs, b, device,
                                 A_r * k_cand, 1).repeat(
                                 1, sim_samples).reshape(-1)
                             L_eff = 0        # the rollout loop is skipped
+                            # free the per-forward simulation tensors: they
+                            # would otherwise stay bound to these locals
+                            # (~15 GB at CHUNK=8192) until the next s-chunk
+                            # rebinds them, inflating the prescreen's peak
+                            del sim_in1m, parts1m, sim_inA, partsA, mu_outA
+                            del mu1p, sigma_outA, sig1p, sim_in2, parts2
+                            del sigma_out2, sig2, z1, z2, obs_z1, obs2
+                            del p1, p2
                         elif (variant in SIM_NESTED_LOOKAHEAD_VARIANTS
                               or variant in SIM_PAIR_LOOKAHEAD_VARIANTS):
                             # ---- NESTED rollout (sigma_lookahead_sample_
